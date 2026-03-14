@@ -6,7 +6,8 @@ WORKDIR /app
 COPY . /app
 
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --no-deps metathreads
 
 RUN mkdir -p /app/images /app/logs
 
@@ -20,6 +21,6 @@ CMD ["sh", "-c", "\
     uvicorn web_app.main:app --host 0.0.0.0 --port 8000 --log-level info & \
     while true; do \
         python bot.py 2>&1; \
-        echo '[RESTART] bot.py упал, перезапуск через 5 сек...'; \
+        echo '[RESTART] Перезапуск через 5 сек...'; \
         sleep 5; \
     done"]
