@@ -1,13 +1,25 @@
 ### ai_gen.py
 import os, json, re, logging
-from openai import OpenAI
 from dotenv import load_dotenv
 import storage
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-client = OpenAI(api_key=os.environ['AITUNNEL_API_KEY'], base_url='https://api.aitunnel.ru/v1/')
+# БАГ ИСПРАВЛЕН: клиент создаётся лениво, не при импорте
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        from openai import OpenAI
+        api_key = os.environ.get('AITUNNEL_API_KEY')
+        if not api_key:
+            raise Exception("AITUNNEL_API_KEY не задан в .env")
+        _client = OpenAI(api_key=api_key, base_url='https://api.aitunnel.ru/v1/')
+    return _client
+
 
 DEFAULT_ACCOUNT_PROMPT = '''
 Ты пишешь конверсионные посты для Threads о SLASH VPN.
@@ -45,7 +57,7 @@ def _prompts(account_login=None):
 
 def generate_topic(account_login=None):
     _, topic_prompt = _prompts(account_login)
-    r = client.chat.completions.create(
+    r = _get_client().chat.completions.create(
         model='gpt-4.1-nano',
         messages=[{'role': 'system', 'content': topic_prompt},
                   {'role': 'user',   'content': 'Придумай тему'}],
@@ -56,7 +68,7 @@ def generate_topic(account_login=None):
 
 def generate_series(topic, account_login=None):
     account_prompt, _ = _prompts(account_login)
-    r = client.chat.completions.create(
+    r = _get_client().chat.completions.create(
         model='gpt-4.1-nano',
         messages=[{'role': 'system', 'content': account_prompt},
                   {'role': 'user',   'content': f'Тема: {topic}'}],

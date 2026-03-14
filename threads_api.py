@@ -9,7 +9,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _clients: dict = {}
-_pending_2fa: dict = {}
+_pending_2fa: dict = {}  # login -> {'password': ..., 'login': ...}
 
 
 def load_accounts_from_db():
@@ -23,9 +23,12 @@ def load_accounts_from_db():
                     'sessionid': acc['session_id'],
                     'csrftoken':  acc['csrf_token'],
                 })
-                client.username = acc['username']
-                client.user_id  = acc['user_id']
-                _clients[acc['login']] = client
+                _clients[acc['login']] = {
+                    'client':   client,
+                    'username': acc['username'],
+                    'user_id':  acc['user_id'],
+                    'login':    acc['login'],
+                }
                 logger.info(f"Загружен: {acc['login']}")
             except Exception as e:
                 logger.warning(f"Не удалось загрузить {acc['login']}: {e}")
@@ -33,36 +36,36 @@ def load_accounts_from_db():
 
 
 def add_account(login, password):
-    """Авторизация через мобильный API. При 2FA бросает TwoFactorRequired."""
     logger.info(f"[{login}] Авторизация...")
     try:
         result = threads_auth.login(login, password)
         return _save_from_result(login, result)
     except TwoFactorRequired:
-        # Сохраняем для confirm_2fa
+        # БАГ ИСПРАВЛЕН: сохраняем пароль ДО pop, не после
         _pending_2fa[login] = {'login': login, 'password': password}
         raise
 
 
 def confirm_2fa(login, code):
-    """Подтверждение 2FA кода."""
     if login not in _pending_2fa:
-        raise Exception("Сессия 2FA не найдена. Начни заново через /add_account")
-    _pending_2fa.pop(login)
-    # Пробуем через metathreads
+        raise Exception("Сессия 2FA не найдена. Начни заново.")
+    # БАГ ИСПРАВЛЕН: сначала читаем пароль, потом удаляем
+    pending  = _pending_2fa.pop(login)
+    password = pending.get('password', '')
     try:
         from metathreads import MetaThreads
         client = MetaThreads()
-        client.login(login, _pending_2fa.get('password', ''))
+        client.login(login, password)
         return _save_from_client(login, client)
-    except Exception:
-        raise Exception("Не удалось подтвердить 2FA. Используй /manual_cookies")
+    except Exception as e:
+        # Возвращаем в pending чтобы можно было попробовать снова
+        _pending_2fa[login] = pending
+        raise Exception(f"Не удалось подтвердить 2FA: {e}. Используй /manual_cookies")
 
 
 def add_account_manual(login, session_id, csrf_token):
-    """Добавление через cookies из браузера."""
     from metathreads import MetaThreads
-    client = MetaThreads()
+    client   = MetaThreads()
     client.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
     user_id  = ''
     username = login
@@ -73,22 +76,33 @@ def add_account_manual(login, session_id, csrf_token):
             username = me.get('username', login)
     except Exception as e:
         logger.warning(f"[{login}] Профиль не получен: {e}")
-    client.username = username
-    client.user_id  = user_id
-    _clients[login] = client
+
+    _clients[login] = {
+        'client':   client,
+        'username': username,
+        'user_id':  user_id,
+        'login':    login,
+    }
     storage.save_account({'login': login, 'session_id': session_id,
-                          'csrf_token': csrf_token, 'user_id': user_id, 'username': username})
-    logger.info(f"[{login}] Добавлен вручную")
+                          'csrf_token': csrf_token, 'user_id': user_id,
+                          'username': username})
+    logger.info(f"[{login}] Добавлен вручную. username={username}")
     return {'login': login, 'username': username}
 
 
 def _save_from_result(login, result):
     from metathreads import MetaThreads
     client = MetaThreads()
-    client.session.cookies.update({'sessionid': result['session_id'], 'csrftoken': result['csrf_token']})
-    client.username = result['username']
-    client.user_id  = result['user_id']
-    _clients[login] = client
+    client.session.cookies.update({
+        'sessionid': result['session_id'],
+        'csrftoken':  result['csrf_token'],
+    })
+    _clients[login] = {
+        'client':   client,
+        'username': result['username'],
+        'user_id':  result['user_id'],
+        'login':    login,
+    }
     storage.save_account({'login': login, **result})
     return {'login': login, 'username': result['username']}
 
@@ -97,15 +111,29 @@ def _save_from_client(login, client):
     cookies    = client.session.cookies.get_dict()
     session_id = cookies.get('sessionid', '')
     csrf_token = cookies.get('csrftoken', '')
-    user_id    = str(getattr(client, 'user_id', '') or '')
-    username   = str(getattr(client, 'username', login) or login)
-    _clients[login] = client
+    user_id    = ''
+    username   = login
+    try:
+        me = client.me
+        if me:
+            user_id  = str(me.get('pk') or me.get('id', ''))
+            username = me.get('username', login)
+    except Exception:
+        pass
+    _clients[login] = {
+        'client':   client,
+        'username': username,
+        'user_id':  user_id,
+        'login':    login,
+    }
     storage.save_account({'login': login, 'session_id': session_id,
-                          'csrf_token': csrf_token, 'user_id': user_id, 'username': username})
+                          'csrf_token': csrf_token, 'user_id': user_id,
+                          'username': username})
     return {'login': login, 'username': username}
 
 
 def get_client(login=None):
+    """Возвращает dict {'client', 'username', 'user_id', 'login'}."""
     if login and login in _clients:
         return _clients[login]
     if not login and _clients:
@@ -118,9 +146,10 @@ def list_accounts():
 
 
 def post_series(posts, image_path=None, account_login=None):
-    client = get_client(account_login)
-    ids = []
-    logger.info(f"[{account_login}] Публикую серию: {posts.get('topic','—')}")
+    entry  = get_client(account_login)
+    client = entry['client']
+    ids    = []
+    logger.info(f"[{entry['login']}] Публикую: {posts.get('topic','—')}")
 
     r1  = client.post_thread(thread_caption=posts['post1'])
     id1 = _pk(r1); ids.append(id1)
@@ -143,84 +172,63 @@ def post_series(posts, image_path=None, account_login=None):
     r4  = client.post_thread(thread_caption=posts['post4'], reply_to=id3)
     id4 = _pk(r4); ids.append(id4)
     logger.info(f"Пост 4: {id4}")
-
     return ids
 
 
 def get_thread_replies(post_id, account_login=None):
-    """Получить комментарии к посту."""
-    client = get_client(account_login)
     try:
-        return client.get_thread_replies(post_id) or []
+        return get_client(account_login)['client'].get_thread_replies(post_id) or []
     except Exception as e:
-        logger.warning(f"get_thread_replies ошибка: {e}")
-        return []
+        logger.warning(f"get_thread_replies: {e}"); return []
 
 
 def like_thread(post_id, account_login=None):
-    client = get_client(account_login)
     try:
-        client.like_thread(post_id)
-        return True
+        get_client(account_login)['client'].like_thread(post_id); return True
     except Exception as e:
-        logger.warning(f"like_thread ошибка: {e}")
-        return False
+        logger.warning(f"like_thread: {e}"); return False
 
 
 def repost_thread(post_id, account_login=None):
-    client = get_client(account_login)
     try:
-        client.repost_thread(post_id)
-        return True
+        get_client(account_login)['client'].repost_thread(post_id); return True
     except Exception as e:
-        logger.warning(f"repost_thread ошибка: {e}")
-        return False
+        logger.warning(f"repost_thread: {e}"); return False
 
 
 def follow_user(user_id, account_login=None):
-    client = get_client(account_login)
     try:
-        client.follow_user(user_id)
-        return True
+        get_client(account_login)['client'].follow_user(user_id); return True
     except Exception as e:
-        logger.warning(f"follow_user ошибка: {e}")
-        return False
+        logger.warning(f"follow_user: {e}"); return False
 
 
 def search_users(query, account_login=None):
-    client = get_client(account_login)
     try:
-        return client.search_user(query) or []
+        return get_client(account_login)['client'].search_user(query) or []
     except Exception as e:
-        logger.warning(f"search_user ошибка: {e}")
-        return []
+        logger.warning(f"search_user: {e}"); return []
 
 
 def get_user_threads(user_id, account_login=None):
-    client = get_client(account_login)
     try:
-        return client.get_user_threads(user_id) or []
+        return get_client(account_login)['client'].get_user_threads(user_id) or []
     except Exception as e:
-        logger.warning(f"get_user_threads ошибка: {e}")
-        return []
+        logger.warning(f"get_user_threads: {e}"); return []
 
 
 def get_thread_stats(post_id, account_login=None):
-    """Получить статистику поста (лайки, ответы)."""
-    client = get_client(account_login)
     try:
-        thread = client.get_thread(post_id)
-        if not thread:
-            return {}
-        data = thread if isinstance(thread, dict) else {}
+        thread = get_client(account_login)['client'].get_thread(post_id)
+        if not thread: return {}
+        d = thread if isinstance(thread, dict) else {}
         return {
-            'likes':   data.get('like_count', 0),
-            'replies': data.get('reply_count', 0) or data.get('text_post_app_info', {}).get('reply_count', 0),
-            'reposts': data.get('repost_count', 0),
+            'likes':   d.get('like_count', 0),
+            'replies': d.get('reply_count', 0) or d.get('text_post_app_info', {}).get('reply_count', 0),
+            'reposts': d.get('repost_count', 0),
         }
     except Exception as e:
-        logger.warning(f"get_thread_stats ошибка: {e}")
-        return {}
+        logger.warning(f"get_thread_stats: {e}"); return {}
 
 
 def _pk(response):
