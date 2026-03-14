@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  slash_vpn_bot:
+    build: .
+    restart: always
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./images:/app/images
+      - ./slash_vpn_bot.db:/app/slash_vpn_bot.db
+    environment:
+      - PYTHONUNBUFFERED=1

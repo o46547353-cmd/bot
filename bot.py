@@ -1,0 +1,800 @@
+### bot.py
+import os, asyncio, logging, random
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+                           ContextTypes, filters, ConversationHandler)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+import ai_gen, storage, threads_api, warmup, monitor
+from threads_auth import TwoFactorRequired
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+load_dotenv()
+
+BOT_TOKEN     = os.environ['BOT_TOKEN']
+ADMIN_IDS_RAW = os.environ.get('ADMIN_IDS', '')
+ADMIN_IDS     = [int(x.strip()) for x in ADMIN_IDS_RAW.split(',') if x.strip()]
+
+scheduler = AsyncIOScheduler()
+
+# Состояния
+WAIT_2FA                                                  = 1
+WAIT_MANUAL_LOGIN, WAIT_MANUAL_SESSION, WAIT_MANUAL_CSRF  = 10, 11, 12
+WAIT_IMAGE_LOGIN, WAIT_PHOTO                              = 20, 21
+WAIT_SETUP_LOGIN, WAIT_SETUP_KEYWORDS, WAIT_SETUP_PRESET, WAIT_SETUP_PROMPTS = 30, 31, 32, 33
+WAIT_SERIYA_TOPIC                                         = 40
+
+
+def is_admin(upd):
+    if not ADMIN_IDS: return True
+    return upd.effective_user.id in ADMIN_IDS
+
+
+# ─── Главное меню ───
+def kb_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Аккаунты",    callback_data="menu:accounts"),
+         InlineKeyboardButton("📋 Очередь",     callback_data="menu:queue")],
+        [InlineKeyboardButton("🚀 Автопилот",   callback_data="menu:autopilot"),
+         InlineKeyboardButton("📊 Статистика",  callback_data="menu:stats")],
+        [InlineKeyboardButton("⚙️ Настройки",   callback_data="menu:settings"),
+         InlineKeyboardButton("🔍 Статус",      callback_data="menu:status")],
+    ])
+
+
+async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await upd.message.reply_text(
+        "🔒 *SLASH VPN Bot*\n\nВыбери раздел:",
+        parse_mode='Markdown',
+        reply_markup=kb_main()
+    )
+
+
+# ─── Навигация по меню ───
+async def cb_menu(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = upd.callback_query
+    await q.answer()
+    dest = q.data.split(':')[1]
+
+    if dest == 'accounts':
+        await _show_accounts(q)
+    elif dest == 'queue':
+        await _show_queue(q)
+    elif dest == 'autopilot':
+        await _show_autopilot(q)
+    elif dest == 'stats':
+        await _show_stats(q)
+    elif dest == 'settings':
+        await _show_settings(q)
+    elif dest == 'status':
+        await _show_status(q)
+    elif dest == 'main':
+        await q.edit_message_text("🔒 *SLASH VPN Bot*\n\nВыбери раздел:",
+                                  parse_mode='Markdown', reply_markup=kb_main())
+
+
+# ─── Аккаунты ───
+async def _show_accounts(q):
+    accs = threads_api.list_accounts()
+    if not accs:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc:add_info")],
+            [InlineKeyboardButton("◀️ Назад",            callback_data="menu:main")],
+        ])
+        await q.edit_message_text("Нет аккаунтов.\nДобавь через /add\\_account или /manual\\_cookies",
+                                  parse_mode='Markdown', reply_markup=kb)
+        return
+
+    lines = []
+    for a in accs:
+        acc = storage.get_account(a)
+        wp  = "🟢" if acc and acc.get('warmup_active')  else "⚫"
+        ap  = "🟢" if acc and acc.get('autopost_active') else "⚫"
+        q_c = storage.count(a)
+        lines.append(f"{wp} прогрев  {ap} постинг  📋{q_c}\n*@{acc.get('username',a)}*")
+
+    rows = []
+    for a in accs:
+        rows.append([InlineKeyboardButton(f"⚙️ {a}", callback_data=f"acc:manage:{a}")])
+    rows.append([InlineKeyboardButton("➕ Добавить",  callback_data="acc:add_info"),
+                 InlineKeyboardButton("◀️ Назад",     callback_data="menu:main")])
+
+    await q.edit_message_text("\n\n".join(lines), parse_mode='Markdown',
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = upd.callback_query
+    await q.answer()
+    parts = q.data.split(':')
+    action = parts[1]
+
+    if action == 'add_info':
+        await q.edit_message_text(
+            "Как добавить аккаунт:\n\n"
+            "*/add\\_account login password* — через логин и пароль\n"
+            "*/manual\\_cookies* — через cookies из браузера",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu:accounts")
+            ]])
+        )
+
+    elif action == 'manage':
+        login = parts[2]
+        acc   = storage.get_account(login)
+        if not acc:
+            await q.edit_message_text("Аккаунт не найден.")
+            return
+        wp  = "🟢 Вкл" if acc.get('warmup_active')  else "⚫ Выкл"
+        ap  = "🟢 Вкл" if acc.get('autopost_active') else "⚫ Выкл"
+        img = "✅" if storage.get_image(login) else "❌"
+        q_c = storage.count(login)
+        text = (
+            f"*@{acc.get('username', login)}*\n\n"
+            f"Прогрев: {wp}\n"
+            f"Автопостинг: {ap}\n"
+            f"Картинка: {img}\n"
+            f"В очереди: {q_c}\n"
+            f"Пресет: {acc.get('warmup_preset','A')}\n"
+            f"Ключевые слова: `{acc.get('warmup_keywords','—')}`"
+        )
+        toggle_w = "⏹ Стоп прогрев"  if acc.get('warmup_active')  else "▶️ Старт прогрев"
+        toggle_a = "⏹ Стоп постинг"  if acc.get('autopost_active') else "▶️ Старт постинг"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_w, callback_data=f"acc:toggle_w:{login}"),
+             InlineKeyboardButton(toggle_a, callback_data=f"acc:toggle_a:{login}")],
+            [InlineKeyboardButton("🎲 Авто-серия",   callback_data=f"acc:autoseriya:{login}"),
+             InlineKeyboardButton("📋 Очередь",      callback_data=f"acc:queue:{login}")],
+            [InlineKeyboardButton("▶️ Пост сейчас",  callback_data=f"acc:postnow:{login}")],
+            [InlineKeyboardButton("◀️ Назад",        callback_data="menu:accounts")],
+        ])
+        await q.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
+
+    elif action == 'toggle_w':
+        login  = parts[2]
+        acc    = storage.get_account(login)
+        active = not bool(acc.get('warmup_active') if acc else False)
+        storage.set_warmup_active(login, active)
+        await cb_acc(upd, ctx)  # обновить экран
+
+    elif action == 'toggle_a':
+        login  = parts[2]
+        acc    = storage.get_account(login)
+        active = not bool(acc.get('autopost_active') if acc else False)
+        storage.set_autopost_active(login, active)
+        await cb_acc(upd, ctx)
+
+    elif action == 'autoseriya':
+        login = parts[2]
+        await q.edit_message_text(f"⏳ Генерирую для *{login}*...", parse_mode='Markdown')
+        try:
+            topic  = await asyncio.to_thread(ai_gen.generate_topic, login)
+            series = await asyncio.to_thread(ai_gen.generate_series, topic, login)
+            storage.add_series(series, login)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Опубликовать сейчас", callback_data=f"acc:postnow:{login}"),
+                InlineKeyboardButton("◀️ Назад",               callback_data=f"acc:manage:{login}"),
+            ]])
+            await q.edit_message_text(
+                f"✅ Тема: *{topic}*\nОчередь: {storage.count(login)}",
+                parse_mode='Markdown', reply_markup=kb
+            )
+        except Exception as e:
+            await q.edit_message_text(f"❌ {e}\n\nПопробуй ещё раз.",
+                                      reply_markup=InlineKeyboardMarkup([[
+                                          InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}")
+                                      ]]))
+
+    elif action == 'postnow':
+        login = parts[2]
+        await q.edit_message_text(f"⏳ Публикую для *{login}*...", parse_mode='Markdown')
+        try:
+            await _do_post(login)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}"),
+            ]])
+            await q.edit_message_text("✅ Серия опубликована!", reply_markup=kb)
+        except Exception as e:
+            await q.edit_message_text(f"❌ {e}",
+                                      reply_markup=InlineKeyboardMarkup([[
+                                          InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}")
+                                      ]]))
+
+    elif action == 'queue':
+        login = parts[2]
+        items = storage.get_queue(login)
+        if not items:
+            await q.edit_message_text(
+                f"Очередь для *{login}* пуста.",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎲 Добавить серию", callback_data=f"acc:autoseriya:{login}"),
+                    InlineKeyboardButton("◀️ Назад",          callback_data=f"acc:manage:{login}"),
+                ]])
+            )
+            return
+        lines = [f"📋 *Очередь @{login}* ({len(items)})\n"]
+        for i, it in enumerate(items[:8]):
+            lines.append(f"{i+1}. {it['topic']} ({it['added_at'][:10]})")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Опубликовать первую", callback_data=f"acc:postnow:{login}"),
+            InlineKeyboardButton("◀️ Назад",               callback_data=f"acc:manage:{login}"),
+        ]])
+        await q.edit_message_text("\n".join(lines), parse_mode='Markdown', reply_markup=kb)
+
+
+# ─── Автопилот ───
+async def _show_autopilot(q):
+    accs = threads_api.list_accounts()
+    if not accs:
+        await q.edit_message_text("Нет аккаунтов.",
+                                  reply_markup=InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("◀️ Назад", callback_data="menu:main")
+                                  ]]))
+        return
+
+    lines = ["🚀 *Автопилот*\n"]
+    rows  = []
+    for a in accs:
+        acc = storage.get_account(a)
+        wp  = "🟢" if acc and acc.get('warmup_active')  else "⚫"
+        ap  = "🟢" if acc and acc.get('autopost_active') else "⚫"
+        lines.append(f"{wp} прогрев {ap} постинг — *@{acc.get('username',a)}*")
+        rows.append([
+            InlineKeyboardButton(f"{'⏹' if acc and acc.get('warmup_active') else '▶️'} прогрев {a}",
+                                 callback_data=f"ap:w:{a}"),
+            InlineKeyboardButton(f"{'⏹' if acc and acc.get('autopost_active') else '▶️'} постинг {a}",
+                                 callback_data=f"ap:a:{a}"),
+        ])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    await q.edit_message_text("\n".join(lines), parse_mode='Markdown',
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_autopilot(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q      = upd.callback_query
+    await q.answer()
+    parts  = q.data.split(':')
+    action = parts[1]
+    login  = parts[2]
+    acc    = storage.get_account(login)
+    if action == 'w':
+        storage.set_warmup_active(login, not bool(acc.get('warmup_active') if acc else False))
+    elif action == 'a':
+        storage.set_autopost_active(login, not bool(acc.get('autopost_active') if acc else False))
+    await _show_autopilot(q)
+
+
+# ─── Статистика ───
+async def _show_stats(q):
+    accs = threads_api.list_accounts()
+    if not accs:
+        await q.edit_message_text("Нет аккаунтов.",
+                                  reply_markup=InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("◀️ Назад", callback_data="menu:main")
+                                  ]]))
+        return
+    rows = [[InlineKeyboardButton(f"📊 @{a}", callback_data=f"stats:show:{a}")] for a in accs]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    await q.edit_message_text("📊 *Статистика*\nВыбери аккаунт:",
+                              parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_stats(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q     = upd.callback_query
+    await q.answer()
+    login = q.data.split(':')[2]
+    stats = storage.get_post_stats(login)
+    if not stats:
+        await q.edit_message_text(
+            f"Нет данных для *@{login}*",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu:stats")
+            ]])
+        )
+        return
+    lines = [f"📊 *@{login}*\n"]
+    for s in stats[:6]:
+        lines.append(
+            f"_{s['topic'][:35]}_\n"
+            f"❤️{s['likes']} 💬{s['replies']} 🔁{s['reposts']} ·{s['hours_after']}ч\n"
+        )
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Обновить", callback_data=f"stats:show:{login}"),
+            InlineKeyboardButton("◀️ Назад",    callback_data="menu:stats"),
+        ]])
+    )
+
+
+# ─── Настройки ───
+async def _show_settings(q):
+    interval = storage.get_setting('interval_hours', '4')
+    accs     = threads_api.list_accounts()
+    rows     = []
+    for a in accs:
+        rows.append([InlineKeyboardButton(f"⚙️ Настроить @{a}", callback_data=f"settings:setup:{a}")])
+    rows.append([InlineKeyboardButton(f"⏱ Интервал: {interval}ч", callback_data="settings:interval")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    await q.edit_message_text(
+        "⚙️ *Настройки*\n\nВыбери аккаунт для настройки или измени интервал постинга:",
+        parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def cb_settings(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q      = upd.callback_query
+    await q.answer()
+    parts  = q.data.split(':')
+    action = parts[1]
+
+    if action == 'interval':
+        await q.edit_message_text(
+            "Укажи интервал через команду:\n`/interval 4`",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu:settings")
+            ]])
+        )
+    elif action == 'setup':
+        login = parts[2]
+        await q.edit_message_text(
+            f"Настройка *@{login}*:\n\n"
+            "*/setup* — тематика, промпты, пресет\n"
+            "*/kartinka* — загрузить картинку",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu:settings")
+            ]])
+        )
+
+
+# ─── Статус ───
+async def _show_status(q):
+    accs     = threads_api.list_accounts()
+    interval = storage.get_setting('interval_hours', '4')
+    total_q  = storage.count()
+    lines    = [
+        "🤖 *Статус бота*\n",
+        f"Аккаунты: {len(accs)}",
+        f"Очередь: {total_q}",
+        f"Интервал: {interval}ч\n",
+    ]
+    for a in accs:
+        acc = storage.get_account(a)
+        if not acc: continue
+        wp  = "🟢" if acc.get('warmup_active')  else "⚫"
+        ap  = "🟢" if acc.get('autopost_active') else "⚫"
+        img = "🖼✅" if storage.get_image(a) else "🖼❌"
+        q_c = storage.count(a)
+        lines.append(f"{wp} прогрев {ap} постинг {img}\n*@{acc.get('username',a)}* | очередь: {q_c}")
+
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data="menu:status"),
+             InlineKeyboardButton("◀️ Назад",    callback_data="menu:main")],
+        ])
+    )
+
+
+# ─── Очередь ───
+async def _show_queue(q):
+    items = storage.get_queue()
+    if not items:
+        await q.edit_message_text(
+            "📋 Очередь пуста.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="menu:main")
+            ]])
+        )
+        return
+    lines = [f"📋 *Очередь* ({len(items)})\n"]
+    for i, it in enumerate(items[:10]):
+        lines.append(f"{i+1}. [{it['account_login']}] {it['topic']} ({it['added_at'][:10]})")
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Опубликовать первую", callback_data="queue:postnow"),
+             InlineKeyboardButton("🔄 Обновить",            callback_data="menu:queue")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+        ])
+    )
+
+
+async def cb_queue(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.callback_query
+    await q.answer()
+    if q.data == 'queue:postnow':
+        await q.edit_message_text("⏳ Публикую...")
+        try:
+            await _do_post()
+            await q.edit_message_text("✅ Опубликовано!",
+                                      reply_markup=InlineKeyboardMarkup([[
+                                          InlineKeyboardButton("◀️ К очереди", callback_data="menu:queue")
+                                      ]]))
+        except Exception as e:
+            await q.edit_message_text(f"❌ {e}",
+                                      reply_markup=InlineKeyboardMarkup([[
+                                          InlineKeyboardButton("◀️ Назад", callback_data="menu:queue")
+                                      ]]))
+
+
+# ─── Команды (текстовые, дублируют кнопки) ───
+async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(upd): return
+    if len(ctx.args) < 2:
+        await upd.message.reply_text("Используй: /add_account login password")
+        return
+    login, password = ctx.args[0], ctx.args[1]
+    ctx.user_data['pending_login']    = login
+    ctx.user_data['pending_password'] = password
+    msg = await upd.message.reply_text(f"⏳ Авторизую *{login}*...", parse_mode='Markdown')
+    try:
+        await asyncio.to_thread(threads_api.add_account, login, password)
+        await msg.edit_text(f"✅ Аккаунт *{login}* добавлен",
+                            parse_mode='Markdown',
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")
+                            ]]))
+        return ConversationHandler.END
+    except TwoFactorRequired:
+        ctx.user_data['2fa_login'] = login
+        await msg.edit_text(
+            f"🔐 Нужен код 2FA для *{login}*\n\nВведи 6-значный код:",
+            parse_mode='Markdown'
+        )
+        return WAIT_2FA
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+        return ConversationHandler.END
+
+
+async def handle_2fa(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    code  = upd.message.text.strip()
+    login = ctx.user_data.get('2fa_login')
+    msg   = await upd.message.reply_text("⏳ Проверяю код...")
+    try:
+        await asyncio.to_thread(threads_api.confirm_2fa, login, code)
+        await msg.edit_text(f"✅ *{login}* добавлен (2FA ок)",
+                            parse_mode='Markdown',
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")
+                            ]]))
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}",
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("🔑 Попробовать cookies", callback_data="acc:add_info")
+                            ]]))
+    return ConversationHandler.END
+
+
+async def cmd_manual_cookies(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(upd): return
+    await upd.message.reply_text(
+        "Введи логин аккаунта:\n\n"
+        "📌 F12 → Application → Cookies → threads.net\n"
+        "Нужны: `sessionid` и `csrftoken`",
+        parse_mode='Markdown'
+    )
+    return WAIT_MANUAL_LOGIN
+
+async def manual_login_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data['m_login'] = upd.message.text.strip()
+    await upd.message.reply_text("Введи *sessionid*:", parse_mode='Markdown')
+    return WAIT_MANUAL_SESSION
+
+async def manual_session_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data['m_session'] = upd.message.text.strip()
+    await upd.message.reply_text("Введи *csrftoken*:", parse_mode='Markdown')
+    return WAIT_MANUAL_CSRF
+
+async def manual_csrf_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = ctx.user_data['m_login']
+    try:
+        await asyncio.to_thread(threads_api.add_account_manual, login,
+                                ctx.user_data['m_session'], upd.message.text.strip())
+        await upd.message.reply_text(f"✅ *{login}* добавлен",
+                                     parse_mode='Markdown',
+                                     reply_markup=InlineKeyboardMarkup([[
+                                         InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")
+                                     ]]))
+    except Exception as e:
+        await upd.message.reply_text(f"❌ {e}")
+    return ConversationHandler.END
+
+
+async def cmd_setup(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(upd): return
+    accs = threads_api.list_accounts()
+    if not accs:
+        await upd.message.reply_text("Нет аккаунтов.")
+        return ConversationHandler.END
+    await upd.message.reply_text(
+        f"Аккаунты: {', '.join(accs)}\n\nВведи логин для настройки:"
+    )
+    return WAIT_SETUP_LOGIN
+
+async def setup_login_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = upd.message.text.strip()
+    if login not in threads_api.list_accounts():
+        await upd.message.reply_text("Не найден. Введи ещё раз:")
+        return WAIT_SETUP_LOGIN
+    ctx.user_data['setup_login'] = login
+    acc = storage.get_account(login)
+    cur = acc.get('warmup_keywords', 'vpn,безопасность') if acc else 'vpn,безопасность'
+    await upd.message.reply_text(
+        f"Ключевые слова тематики (через запятую):\nТекущие: `{cur}`",
+        parse_mode='Markdown'
+    )
+    return WAIT_SETUP_KEYWORDS
+
+async def setup_keywords_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data['setup_keywords'] = upd.message.text.strip()
+    await upd.message.reply_text(
+        "Пресет прогрева:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("A — Осторожный (8-25 лайков)", callback_data="preset:A")],
+            [InlineKeyboardButton("B — Активный (15-30 лайков)",  callback_data="preset:B")],
+        ])
+    )
+    return WAIT_SETUP_PRESET
+
+async def cb_preset(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q      = upd.callback_query
+    await q.answer()
+    preset = q.data.split(':')[1]
+    ctx.user_data['setup_preset'] = preset
+    await q.edit_message_text(
+        f"Пресет: *{preset}*\n\nТеперь введи промпт для постов\n(или `-` чтобы оставить по умолчанию):",
+        parse_mode='Markdown'
+    )
+    return WAIT_SETUP_PROMPTS
+
+async def setup_prompts_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login    = ctx.user_data['setup_login']
+    keywords = ctx.user_data['setup_keywords']
+    preset   = ctx.user_data.get('setup_preset', 'A')
+    text     = upd.message.text.strip()
+    storage.update_warmup_settings(login, keywords, preset, 'Europe/Moscow')
+    if text != '-':
+        storage.update_account_prompts(login, text, '')
+    await upd.message.reply_text(
+        f"✅ Настройки сохранены для *{login}*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚙️ К настройкам", callback_data="menu:settings"),
+            InlineKeyboardButton("🚀 Автопилот",     callback_data="menu:autopilot"),
+        ]])
+    )
+    return ConversationHandler.END
+
+
+async def cmd_kartinka(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(upd): return
+    accs = threads_api.list_accounts()
+    if not accs:
+        await upd.message.reply_text("Нет аккаунтов.")
+        return ConversationHandler.END
+    await upd.message.reply_text(
+        f"Аккаунты: {', '.join(accs)}\n\nВведи логин:"
+    )
+    return WAIT_IMAGE_LOGIN
+
+async def kartinka_login_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = upd.message.text.strip()
+    if login not in threads_api.list_accounts():
+        await upd.message.reply_text("Не найден. Введи ещё раз:")
+        return WAIT_IMAGE_LOGIN
+    ctx.user_data['img_login'] = login
+    await upd.message.reply_text(f"Отправь фото для *{login}* как фото (не файл):",
+                                 parse_mode='Markdown')
+    return WAIT_PHOTO
+
+async def handle_photo(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = ctx.user_data.get('img_login')
+    if not login: return ConversationHandler.END
+    file  = await ctx.bot.get_file(upd.message.photo[-1].file_id)
+    os.makedirs('images', exist_ok=True)
+    path  = f"images/{login}.jpg"
+    await file.download_to_drive(path)
+    storage.set_image(login, path)
+    await upd.message.reply_text(
+        f"✅ Картинка сохранена для *{login}*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")
+        ]])
+    )
+    return ConversationHandler.END
+
+
+async def cmd_seriya(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or len(ctx.args) < 2:
+        await upd.message.reply_text("Используй: /seriya login тема серии")
+        return
+    login  = ctx.args[0]
+    topic  = ' '.join(ctx.args[1:])
+    if login not in threads_api.list_accounts():
+        await upd.message.reply_text(f"❌ Аккаунт {login} не найден.")
+        return
+    msg = await upd.message.reply_text(f"⏳ Генерирую: _{topic}_...", parse_mode='Markdown')
+    try:
+        series = await asyncio.to_thread(ai_gen.generate_series, topic, login)
+        storage.add_series(series, login)
+        preview = series['post1'][:120] + '...'
+        await msg.edit_text(
+            f"✅ Серия добавлена ({storage.count(login)} в очереди)\n\n*Хук:* {preview}",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Пост сейчас", callback_data=f"acc:postnow:{login}"),
+                InlineKeyboardButton("📋 Очередь",      callback_data=f"acc:queue:{login}"),
+            ]])
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+
+
+async def cmd_interval(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(upd): return
+    if not ctx.args:
+        cur = storage.get_setting('interval_hours', '4')
+        await upd.message.reply_text(
+            f"Текущий интервал: *{cur} ч.*\n\nИспользуй: `/interval 4`",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("2ч",  callback_data="interval:2"),
+                 InlineKeyboardButton("4ч",  callback_data="interval:4"),
+                 InlineKeyboardButton("6ч",  callback_data="interval:6"),
+                 InlineKeyboardButton("12ч", callback_data="interval:12")],
+            ])
+        )
+        return
+    try:
+        h = int(ctx.args[0])
+        storage.set_setting('interval_hours', h)
+        _reschedule_post(h)
+        await upd.message.reply_text(f"✅ Интервал: *{h} ч.*", parse_mode='Markdown')
+    except ValueError:
+        await upd.message.reply_text("Укажи целое число часов")
+
+
+async def cb_interval(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.callback_query
+    await q.answer()
+    h = int(q.data.split(':')[1])
+    storage.set_setting('interval_hours', h)
+    _reschedule_post(h)
+    await q.edit_message_text(f"✅ Интервал: *{h} ч.*", parse_mode='Markdown',
+                              reply_markup=InlineKeyboardMarkup([[
+                                  InlineKeyboardButton("◀️ Назад", callback_data="menu:settings")
+                              ]]))
+
+
+async def conv_cancel(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await upd.message.reply_text("Отменено.", reply_markup=kb_main())
+    return ConversationHandler.END
+
+
+# ─── Планировщик ───
+async def _do_post(account_login=None):
+    item = storage.pop(account_login)
+    if not item:
+        raise Exception("Очередь пуста")
+    login = item['account_login']
+    image = storage.get_image(login)
+    acc   = storage.get_account(login)
+    if acc and acc.get('warmup_active'):
+        await warmup.pre_post_warmup(login)
+    ids = await asyncio.to_thread(threads_api.post_series, item['posts'], image, login)
+    storage.archive_item(item['posts'], login, ids)
+    return ids
+
+
+async def _scheduler_post():
+    from humanize import is_active_hour
+    for login in threads_api.list_accounts():
+        acc = storage.get_account(login)
+        if not acc or not acc.get('autopost_active'): continue
+        if not is_active_hour(acc.get('timezone', 'Europe/Moscow')): continue
+        if storage.count(login) > 0:
+            try:
+                await _do_post(login)
+                await asyncio.sleep(random.uniform(300, 900))
+            except Exception as e:
+                logger.error(f"Ошибка публикации {login}: {e}")
+
+
+async def _scheduler_warmup():
+    for login in threads_api.list_accounts():
+        acc = storage.get_account(login)
+        if not acc or not acc.get('warmup_active'): continue
+        await warmup.run_warmup_session(login)
+        await asyncio.sleep(random.uniform(60, 300))
+
+
+async def _scheduler_monitor():
+    await monitor.check_all_comments()
+    await monitor.check_post_stats()
+
+
+def _reschedule_post(hours):
+    if scheduler.get_job('post'): scheduler.remove_job('post')
+    scheduler.add_job(_scheduler_post, 'interval', hours=hours, jitter=1800, id='post')
+
+
+async def on_startup(app):
+    threads_api.load_accounts_from_db()
+    monitor.set_telegram(app, ADMIN_IDS)
+    interval = int(storage.get_setting('interval_hours', '4'))
+    scheduler.add_job(_scheduler_post,    'interval', hours=interval, jitter=1800, id='post')
+    scheduler.add_job(_scheduler_warmup,  'interval', hours=8,        jitter=600,  id='warmup')
+    scheduler.add_job(_scheduler_monitor, 'interval', minutes=30,     jitter=120,  id='monitor')
+    scheduler.start()
+    logger.info(f"Запущен. Интервал постинга: {interval}ч")
+
+
+# ─── Сборка ───
+def build_app():
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+
+    # Команды
+    app.add_handler(CommandHandler('start',    cmd_start))
+    app.add_handler(CommandHandler('seriya',   cmd_seriya))
+    app.add_handler(CommandHandler('interval', cmd_interval))
+
+    # Callback кнопки
+    app.add_handler(CallbackQueryHandler(cb_menu,      pattern=r'^menu:'))
+    app.add_handler(CallbackQueryHandler(cb_acc,       pattern=r'^acc:'))
+    app.add_handler(CallbackQueryHandler(cb_autopilot, pattern=r'^ap:'))
+    app.add_handler(CallbackQueryHandler(cb_stats,     pattern=r'^stats:'))
+    app.add_handler(CallbackQueryHandler(cb_settings,  pattern=r'^settings:'))
+    app.add_handler(CallbackQueryHandler(cb_queue,     pattern=r'^queue:'))
+    app.add_handler(CallbackQueryHandler(cb_interval,  pattern=r'^interval:'))
+
+    # /add_account + 2FA
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('add_account', cmd_add_account)],
+        states={WAIT_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)]},
+        fallbacks=[CommandHandler('cancel', conv_cancel)]
+    ))
+    # /manual_cookies
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('manual_cookies', cmd_manual_cookies)],
+        states={
+            WAIT_MANUAL_LOGIN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_login_h)],
+            WAIT_MANUAL_SESSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_session_h)],
+            WAIT_MANUAL_CSRF:    [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_csrf_h)],
+        },
+        fallbacks=[CommandHandler('cancel', conv_cancel)]
+    ))
+    # /setup
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('setup', cmd_setup)],
+        states={
+            WAIT_SETUP_LOGIN:    [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_login_h)],
+            WAIT_SETUP_KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_keywords_h)],
+            WAIT_SETUP_PRESET:   [CallbackQueryHandler(cb_preset, pattern=r'^preset:')],
+            WAIT_SETUP_PROMPTS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_prompts_h)],
+        },
+        fallbacks=[CommandHandler('cancel', conv_cancel)]
+    ))
+    # /kartinka
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('kartinka', cmd_kartinka)],
+        states={
+            WAIT_IMAGE_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, kartinka_login_h)],
+            WAIT_PHOTO:       [MessageHandler(filters.PHOTO, handle_photo)],
+        },
+        fallbacks=[CommandHandler('cancel', conv_cancel)]
+    ))
+
+    return app
+
+
+if __name__ == '__main__':
+    build_app().run_polling()

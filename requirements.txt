@@ -1,0 +1,12 @@
+python-telegram-bot[job-queue]
+apscheduler
+openai
+python-dotenv
+requests
+cryptography
+metathreads
+pytz
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
