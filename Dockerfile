@@ -1,15 +1,20 @@
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y curl wget && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl wget gcc && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . /app
 
-# Сначала основные зависимости без metathreads
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Шаг 1: основные зависимости
+RUN pip install --no-cache-dir --upgrade pip
 
-# metathreads отдельно — без его зависимостей чтобы не было конфликтов
+# Шаг 2: сначала h11 нужной версии (metathreads требует 0.14.0)
+RUN pip install --no-cache-dir h11==0.14.0
+
+# Шаг 3: остальные зависимости
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Шаг 4: metathreads без его зависимостей (они уже стоят выше)
 RUN pip install --no-cache-dir --no-deps metathreads
 
 RUN mkdir -p /app/images /app/logs

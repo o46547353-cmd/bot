@@ -1,12 +1,26 @@
+# Telegram
 python-telegram-bot[job-queue]>=21.10
+
+# HTTP — совместимые версии для PTB + metathreads
 httpx>=0.27,<0.28
-apscheduler
+h11==0.14.0
+httpcore>=1.0.0,<2.0.0
+
+# AI
 openai>=1.50.0
+
+# Utils
 python-dotenv
 requests
 cryptography
 pytz
+
+# Web панель
 fastapi
 uvicorn[standard]
 jinja2
 python-multipart
+
+# Зависимости metathreads (ставим сами чтобы не было конфликтов)
+beautifulsoup4
+lxml
