@@ -5,23 +5,25 @@ RUN apt-get update && apt-get install -y curl wget gcc && rm -rf /var/lib/apt/li
 WORKDIR /app
 COPY . /app
 
-# Шаг 1: основные зависимости
+# Шаг 1: обновляем pip
 RUN pip install --no-cache-dir --upgrade pip
 
-# Шаг 2: сначала h11 нужной версии (metathreads требует 0.14.0)
+# Шаг 2: h11 нужной версии сначала
 RUN pip install --no-cache-dir h11==0.14.0
 
-# Шаг 3: остальные зависимости
+# Шаг 3: все зависимости (включая apscheduler, threads-api, aiohttp)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Шаг 4: metathreads без его зависимостей (они уже стоят выше)
+# Шаг 4: metathreads без его зависимостей (они уже стоят выше, нужные версии)
 RUN pip install --no-cache-dir --no-deps metathreads
 
 RUN mkdir -p /app/images /app/logs
 
-EXPOSE 8000
+# BUG-14 FIX: убрали uvicorn web_app.main:app — модуль не существует
+# BUG-15 FIX: healthcheck проверяет сам процесс python, а не HTTP-порт
+# Бот работает как pure Telegram bot без web-сервера
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:8000/ || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD pgrep -f "python bot.py" || exit 1
 
-CMD ["sh", "-c", "mkdir -p /app/images && uvicorn web_app.main:app --host 0.0.0.0 --port 8000 --log-level info & while true; do python bot.py 2>&1; echo '[RESTART] через 5 сек...'; sleep 5; done"]
+CMD ["sh", "-c", "mkdir -p /app/images /app/logs && while true; do python bot.py 2>&1 | tee -a /app/logs/bot.log; echo '[RESTART] через 5 сек...'; sleep 5; done"]

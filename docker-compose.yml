@@ -5,10 +5,15 @@ services:
     build: .
     restart: always
     env_file: .env
-    ports:
-      - "8000:8000"
+    # BUG-14/15 FIX: порт 8000 удалён — бот не запускает web-сервер
     volumes:
       - ./images:/app/images
-      - ./slash_vpn_bot.db:/app/slash_vpn_bot.db
+      - ./logs:/app/logs
+      # БД монтируем как директорию чтобы избежать ошибки "is a directory" при первом запуске
+      - bot_data:/app/data
     environment:
       - PYTHONUNBUFFERED=1
+      - DB_FILE=/app/data/slash_vpn_bot.db
+
+volumes:
+  bot_data:
