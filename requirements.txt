@@ -1,6 +1,7 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue]>=21.10
+httpx==0.27.2
 apscheduler
-openai
+openai>=1.50.0
 python-dotenv
 requests
 cryptography
