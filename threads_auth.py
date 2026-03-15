@@ -46,10 +46,14 @@ def _extract_bearer(cl) -> str:
 
 
 def _build_result(cl, username: str) -> dict:
+    cookies   = cl.cookie_dict if hasattr(cl, 'cookie_dict') else {}
+    sessionid = getattr(cl, 'sessionid', None) or cookies.get('sessionid', '')
+    csrftoken = cookies.get('csrftoken', '')
+    bearer    = _extract_bearer(cl)
     return {
-        'sessionid':  cl.sessionid or '',
-        'csrftoken':  cl.csrftoken or '',
-        'auth_token': _extract_bearer(cl),
+        'sessionid':  sessionid,
+        'csrftoken':  csrftoken,
+        'auth_token': bearer,
         'user_id':    str(cl.user_id or ''),
         'username':   cl.username or username,
         'client':     cl,
