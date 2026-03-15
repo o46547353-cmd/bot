@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     login TEXT PRIMARY KEY,
     session_id TEXT DEFAULT '',
     csrf_token TEXT DEFAULT '',
+    auth_type TEXT DEFAULT 'cookie',
     user_id TEXT DEFAULT '',
     username TEXT DEFAULT '',
     account_prompt TEXT DEFAULT '',
@@ -129,25 +130,23 @@ def get_all_accounts():
 def get_account(login):
     row = _fetchone('SELECT * FROM accounts WHERE login=?', (login,))
     if not row: return None
-    keys = ['login','session_id','csrf_token','user_id','username',
-            'account_prompt','topic_prompt','warmup_keywords',
-            'warmup_preset','timezone','warmup_active','autopost_active']
-    return dict(zip(keys, row))
+    return dict(row)  # sqlite3.Row поддерживает dict() напрямую
 
 
 def save_account(account):
     existing = get_account(account['login'])
     if existing:
-        _execute('''UPDATE accounts SET session_id=?,csrf_token=?,user_id=?,username=?
+        _execute('''UPDATE accounts SET session_id=?,csrf_token=?,user_id=?,username=?,auth_type=?
                     WHERE login=?''',
                  (account.get('session_id',''), account.get('csrf_token',''),
                   account.get('user_id',''), account.get('username', account['login']),
-                  account['login']))
+                  account.get('auth_type','cookie'), account['login']))
     else:
-        _execute('''INSERT INTO accounts(login,session_id,csrf_token,user_id,username)
-                    VALUES(?,?,?,?,?)''',
+        _execute('''INSERT INTO accounts(login,session_id,csrf_token,user_id,username,auth_type)
+                    VALUES(?,?,?,?,?,?)''',
                  (account['login'], account.get('session_id',''), account.get('csrf_token',''),
-                  account.get('user_id',''), account.get('username', account['login'])))
+                  account.get('user_id',''), account.get('username', account['login']),
+                  account.get('auth_type','cookie')))
 
 
 def update_account_prompts(login, account_prompt, topic_prompt):
