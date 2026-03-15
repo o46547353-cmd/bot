@@ -205,7 +205,8 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("▶️ Пост сейчас", callback_data=f"acc:postnow:{login}")],
             [InlineKeyboardButton("🖼 Загрузить картинку",     callback_data=f"acc:upload_img:{login}")],
         ]
-        rows.append([InlineKeyboardButton("🧪 Тест прогрева",   callback_data=f"acc:test_warmup:{login}")])
+        rows.append([InlineKeyboardButton("🧪 Тест прогрева",   callback_data=f"acc:test_warmup:{login}"),
+                     InlineKeyboardButton("🔬 Диагностика",     callback_data=f"acc:debug_api:{login}")])
         if show_refresh:
             rows.append([InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
         rows += [
@@ -366,6 +367,14 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         asyncio.ensure_future(_run_warmup_test(q, login))
 
+    elif action == 'debug_api':
+        login = parts[2]
+        await q.edit_message_text(
+            f"🔬 *Диагностика API @{login}*\n\n⏳ Тестирую эндпоинты...",
+            parse_mode='Markdown'
+        )
+        asyncio.ensure_future(_run_api_debug(q, login))
+
 
 async def _run_warmup_test(q, login: str):
     """Прогоняет все методы прогрева по одному и шлёт отчёт."""
@@ -491,6 +500,84 @@ async def _run_warmup_test(q, login: str):
                                    reply_markup=InlineKeyboardMarkup(kb))
     except Exception:
         pass
+
+
+async def _run_api_debug(q, login: str):
+    """Диагностика: сырые HTTP-ответы от разных эндпоинтов."""
+    try:
+        entry  = threads_api.get_client(login)
+        client = entry['client']
+    except Exception as e:
+        await q.edit_message_text(f"❌ Нет клиента: {e}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}")]]))
+        return
+
+    if not client:
+        await q.edit_message_text("❌ SlashThreadsClient = None",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}")]]))
+        return
+
+    # Запускаем debug_search
+    search_results = await asyncio.to_thread(client.debug_search, 'vpn')
+
+    # Запускаем debug_feed (свой профиль)
+    feed_results = await asyncio.to_thread(client.debug_feed)
+
+    # Собираем отчёт
+    lines = [f"🔬 *Диагностика API @{login}*\n"]
+
+    # Auth info
+    auth = search_results.pop('_auth', {})
+    lines.append(f"*Auth:*")
+    lines.append(f"  Bearer: {'✅' if auth.get('has_bearer') else '❌'}")
+    lines.append(f"  Cookie: {'✅' if auth.get('has_session') else '❌'}")
+    lines.append(f"  CSRF: {'✅' if auth.get('has_csrf') else '❌'}")
+    lines.append(f"  user\\_id: `{auth.get('user_id', '?')}`")
+    lines.append('')
+
+    # Search endpoints
+    for name, data in search_results.items():
+        status = data.get('status', '?')
+        body   = data.get('body', '')[:150]
+        # Escape markdown
+        body = body.replace('`', "'").replace('*', '').replace('_', '')
+        emoji = '✅' if status == 200 else '❌'
+        lines.append(f"{emoji} *{name}*")
+        lines.append(f"  HTTP {status}")
+        lines.append(f"  `{body}`")
+        lines.append('')
+
+    # Feed
+    for name, data in feed_results.items():
+        status = data.get('status', '?')
+        body   = data.get('body', '')[:150]
+        body = body.replace('`', "'").replace('*', '').replace('_', '')
+        emoji = '✅' if status == 200 else '❌'
+        lines.append(f"{emoji} *{name}*")
+        lines.append(f"  HTTP {status}")
+        lines.append(f"  `{body}`")
+        lines.append('')
+
+    text = '\n'.join(lines)
+    # Telegram limit 4096
+    if len(text) > 4000:
+        text = text[:4000] + '\n...'
+
+    try:
+        await q.edit_message_text(text, parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Повторить", callback_data=f"acc:debug_api:{login}")],
+                [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")],
+            ]))
+    except Exception as e:
+        # Если Markdown сломался — шлём без форматирования
+        try:
+            await q.edit_message_text(text[:4000], parse_mode=None,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")]
+                ]))
+        except Exception:
+            pass
 
 
 # ─── Автопилот ───────────────────────────────────────────────────────────────
