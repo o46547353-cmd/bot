@@ -206,7 +206,7 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🖼 Загрузить картинку",     callback_data=f"acc:upload_img:{login}")],
         ]
         rows.append([InlineKeyboardButton("🧪 Тест прогрева",   callback_data=f"acc:test_warmup:{login}"),
-                     InlineKeyboardButton("🔬 Диагностика",     callback_data=f"acc:debug_api:{login}")])
+                     InlineKeyboardButton("🔬 Скан API",        callback_data=f"acc:scan_api:{login}")])
         if show_refresh:
             rows.append([InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
         rows += [
@@ -367,13 +367,14 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         asyncio.ensure_future(_run_warmup_test(q, login))
 
-    elif action == 'debug_api':
+    elif action == 'scan_api':
         login = parts[2]
         await q.edit_message_text(
-            f"🔬 *Диагностика API @{login}*\n\n⏳ Тестирую эндпоинты...",
+            f"🔬 *Скан API @{login}*\n\n⏳ Тестирую эндпоинты...\n"
+            f"~20 запросов, таймаут 8с каждый.\nМаксимум ~40 секунд.",
             parse_mode='Markdown'
         )
-        asyncio.ensure_future(_run_api_debug(q, login))
+        asyncio.ensure_future(_run_api_scan(q, login))
 
 
 async def _run_warmup_test(q, login: str):
@@ -395,13 +396,16 @@ async def _run_warmup_test(q, login: str):
     # 1. search_users
     users = []
     try:
-        users = await asyncio.to_thread(threads_api.search_users, test_kw, login)
+        users = await asyncio.wait_for(
+            asyncio.to_thread(threads_api.search_users, test_kw, login), timeout=12)
         if users:
             results['🔍 search'] = f'✅ {len(users)} юзеров'
             names = ', '.join(f"@{u.get('username','?')}" for u in users[:3])
             details.append(f"Поиск «{test_kw}»: {names}")
         else:
             results['🔍 search'] = '⚠️ пусто'
+    except asyncio.TimeoutError:
+        results['🔍 search'] = '⏱ таймаут'
     except Exception as e:
         results['🔍 search'] = f'❌ {str(e)[:60]}'
 
@@ -417,13 +421,16 @@ async def _run_warmup_test(q, login: str):
         test_user_id = str(target.get('pk') or target.get('id', ''))
         target_name  = target.get('username', '?')
         try:
-            posts = await asyncio.to_thread(threads_api.get_user_threads, test_user_id, login)
+            posts = await asyncio.wait_for(
+                asyncio.to_thread(threads_api.get_user_threads, test_user_id, login), timeout=12)
             if posts:
                 results['📋 threads'] = f'✅ {len(posts)} постов'
                 test_post_id = str(posts[0].get('pk') or posts[0].get('id', ''))
                 details.append(f"@{target_name}: {len(posts)} постов")
             else:
                 results['📋 threads'] = '⚠️ пусто'
+        except asyncio.TimeoutError:
+            results['📋 threads'] = '⏱ таймаут'
         except Exception as e:
             results['📋 threads'] = f'❌ {str(e)[:60]}'
     else:
@@ -434,10 +441,13 @@ async def _run_warmup_test(q, login: str):
     # 3. like
     if test_post_id:
         try:
-            ok = await asyncio.to_thread(threads_api.like_thread, test_post_id, login)
+            ok = await asyncio.wait_for(
+                asyncio.to_thread(threads_api.like_thread, test_post_id, login), timeout=12)
             results['❤️ like'] = '✅' if ok else '⚠️ False'
             if ok:
                 details.append(f"Лайк: pk={test_post_id}")
+        except asyncio.TimeoutError:
+            results['❤️ like'] = '⏱ таймаут'
         except Exception as e:
             results['❤️ like'] = f'❌ {str(e)[:60]}'
     else:
@@ -448,8 +458,11 @@ async def _run_warmup_test(q, login: str):
     # 4. get_thread_replies
     if test_post_id:
         try:
-            replies = await asyncio.to_thread(threads_api.get_thread_replies, test_post_id, login)
+            replies = await asyncio.wait_for(
+                asyncio.to_thread(threads_api.get_thread_replies, test_post_id, login), timeout=12)
             results['💬 replies'] = f'✅ {len(replies)} ответов'
+        except asyncio.TimeoutError:
+            results['💬 replies'] = '⏱ таймаут'
         except Exception as e:
             results['💬 replies'] = f'❌ {str(e)[:60]}'
     else:
@@ -460,11 +473,14 @@ async def _run_warmup_test(q, login: str):
     # 5. get_thread_stats
     if test_post_id:
         try:
-            stats = await asyncio.to_thread(threads_api.get_thread_stats, test_post_id, login)
+            stats = await asyncio.wait_for(
+                asyncio.to_thread(threads_api.get_thread_stats, test_post_id, login), timeout=12)
             if stats:
                 results['📊 stats'] = f"✅ ❤️{stats.get('likes',0)} 💬{stats.get('replies',0)} 🔁{stats.get('reposts',0)}"
             else:
                 results['📊 stats'] = '⚠️ пусто'
+        except asyncio.TimeoutError:
+            results['📊 stats'] = '⏱ таймаут'
         except Exception as e:
             results['📊 stats'] = f'❌ {str(e)[:60]}'
     else:
@@ -502,8 +518,10 @@ async def _run_warmup_test(q, login: str):
         pass
 
 
-async def _run_api_debug(q, login: str):
-    """Диагностика: сырые HTTP-ответы от разных эндпоинтов."""
+async def _run_api_scan(q, login: str):
+    """Полный скан эндпоинтов — threads.net + i.instagram.com."""
+    import json as _json
+
     try:
         entry  = threads_api.get_client(login)
         client = entry['client']
@@ -517,65 +535,141 @@ async def _run_api_debug(q, login: str):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}")]]))
         return
 
-    # Запускаем debug_search
-    search_results = await asyncio.to_thread(client.debug_search, 'vpn')
+    session = client.session
+    uid     = client.user_id
+    duuid   = client._device_uuid
 
-    # Запускаем debug_feed (свой профиль)
-    feed_results = await asyncio.to_thread(client.debug_feed)
+    # Тестовый post_id из архива
+    pid = ''
+    try:
+        archive = storage.get_archive(5)
+        for item in archive:
+            pids = item.get('post_ids', [])
+            if pids:
+                pid = str(pids[0]); break
+    except Exception:
+        pass
 
-    # Собираем отчёт
-    lines = [f"🔬 *Диагностика API @{login}*\n"]
+    # ── Эндпоинты для теста ──
+    ENDPOINTS = [
+        # (base_url, method, path, описание)
+        # --- threads.net GET ---
+        ('threads.net',     'GET',  '/users/search/?q=vpn&count=5',             'Поиск юзеров'),
+        ('threads.net',     'GET',  f'/text_feed/recommended_users/?search_query=vpn', 'Рекомендации'),
+        ('threads.net',     'GET',  '/users/web_profile_info/?username=threads', 'Профиль по username'),
+        ('threads.net',     'GET',  f'/text_feed/{uid}/profile/',               'Мои посты'),
+        ('threads.net',     'GET',  '/text_feed/timeline/',                     'Лента'),
+        ('threads.net',     'GET',  '/accounts/current_user/?edit=true',        'Текущий юзер'),
+        ('threads.net',     'GET',  '/text_feed/text_app_notifications/',       'Уведомления'),
+        ('threads.net',     'GET',  '/text_feed/text_app_settings/',            'Настройки'),
+        ('threads.net',     'GET',  '/qp/batch_fetch/',                         'QP batch'),
+        # --- i.instagram.com GET ---
+        ('i.instagram.com', 'GET',  '/users/search/?q=vpn&count=5',            'Поиск (IG)'),
+        ('i.instagram.com', 'GET',  f'/text_feed/{uid}/profile/',              'Мои посты (IG)'),
+        ('i.instagram.com', 'GET',  '/accounts/current_user/?edit=true',       'Текущий юзер (IG)'),
+        ('i.instagram.com', 'GET',  '/text_feed/timeline/',                    'Лента (IG)'),
+    ]
 
-    # Auth info
-    auth = search_results.pop('_auth', {})
-    lines.append(f"*Auth:*")
-    lines.append(f"  Bearer: {'✅' if auth.get('has_bearer') else '❌'}")
-    lines.append(f"  Cookie: {'✅' if auth.get('has_session') else '❌'}")
-    lines.append(f"  CSRF: {'✅' if auth.get('has_csrf') else '❌'}")
-    lines.append(f"  user\\_id: `{auth.get('user_id', '?')}`")
-    lines.append('')
+    # Добавляем POST-тесты если есть post_id
+    if pid:
+        ENDPOINTS += [
+            ('threads.net',     'GET',  f'/text_feed/{pid}/replies/',           'Ответы на пост'),
+            ('i.instagram.com', 'GET',  f'/text_feed/{pid}/replies/',          'Ответы (IG)'),
+        ]
 
-    # Search endpoints
-    for name, data in search_results.items():
-        status = data.get('status', '?')
-        body   = data.get('body', '')[:150]
-        # Escape markdown
-        body = body.replace('`', "'").replace('*', '').replace('_', '')
-        emoji = '✅' if status == 200 else '❌'
-        lines.append(f"{emoji} *{name}*")
-        lines.append(f"  HTTP {status}")
-        lines.append(f"  `{body}`")
-        lines.append('')
+    def _scan_all():
+        results = []
+        for base, method, path, desc in ENDPOINTS:
+            base_url = f'https://www.{base}/api/v1' if base == 'threads.net' else f'https://{base}/api/v1'
 
-    # Feed
-    for name, data in feed_results.items():
-        status = data.get('status', '?')
-        body   = data.get('body', '')[:150]
-        body = body.replace('`', "'").replace('*', '').replace('_', '')
-        emoji = '✅' if status == 200 else '❌'
-        lines.append(f"{emoji} *{name}*")
-        lines.append(f"  HTTP {status}")
-        lines.append(f"  `{body}`")
-        lines.append('')
+            # Разделяем path и query
+            if '?' in path:
+                path_only, qs = path.split('?', 1)
+                params = dict(p.split('=', 1) for p in qs.split('&') if '=' in p)
+            else:
+                path_only, params = path, None
+
+            url = f'{base_url}{path_only}'
+            import time as _t
+            t0 = _t.time()
+            try:
+                if method == 'GET':
+                    r = session.get(url, params=params, timeout=8, allow_redirects=False)
+                else:
+                    data = {'signed_body': f'SIGNATURE.{_json.dumps({"_uid": uid, "_uuid": duuid})}'}
+                    r = session.post(url, data=data, timeout=8, allow_redirects=False)
+                ms = int((_t.time() - t0) * 1000)
+                results.append({
+                    'base': base, 'method': method, 'path': path_only,
+                    'desc': desc, 'status': r.status_code,
+                    'body': r.text[:200], 'ms': ms,
+                })
+            except Exception as e:
+                ms = int((_t.time() - t0) * 1000)
+                results.append({
+                    'base': base, 'method': method, 'path': path_only,
+                    'desc': desc, 'status': 0,
+                    'body': str(e)[:100], 'ms': ms,
+                })
+        return results
+
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(_scan_all), timeout=120)
+    except asyncio.TimeoutError:
+        await q.edit_message_text(
+            f"🔬 *Скан @{login}*\n\n❌ Общий таймаут 120с — API не отвечает.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Повторить", callback_data=f"acc:scan_api:{login}")],
+                [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")]]))
+        return
+
+    # ── Auth info ──
+    has_bearer = 'Authorization' in session.headers
+    has_cookie = bool(session.cookies.get('sessionid'))
+    has_csrf   = bool(session.cookies.get('csrftoken'))
+
+    # ── Формируем отчёт ──
+    lines = [f"🔬 *Скан API @{login}*\n"]
+    lines.append(f"Bearer:{'✅' if has_bearer else '❌'}  Cookie:{'✅' if has_cookie else '❌'}  CSRF:{'✅' if has_csrf else '❌'}  uid:`{uid}`\n")
+
+    ok_count = 0
+    for r in results:
+        s = r['status']
+        if s == 200:
+            emoji = '✅'; ok_count += 1
+        elif s in (301, 302, 303, 307, 308):
+            emoji = '↗️'
+        elif s == 0:
+            emoji = '⏱'
+        else:
+            emoji = '❌'
+
+        # Короткий body для 200
+        snippet = ''
+        if s == 200:
+            b = r['body'][:60].replace('\n', ' ').replace('`', "'").replace('*', '').replace('_', '')
+            snippet = f' `{b}`'
+
+        lines.append(f"{emoji}`{s:>3}` {r['ms']:>4}ms {r['base'][:6]} {r['desc']}{snippet}")
+
+    lines.append(f"\n*Итого:* {ok_count}✅ / {len(results)} эндпоинтов")
 
     text = '\n'.join(lines)
-    # Telegram limit 4096
     if len(text) > 4000:
-        text = text[:4000] + '\n...'
+        text = text[:4000] + '...'
 
     try:
         await q.edit_message_text(text, parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Повторить", callback_data=f"acc:debug_api:{login}")],
-                [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")],
-            ]))
-    except Exception as e:
-        # Если Markdown сломался — шлём без форматирования
+                [InlineKeyboardButton("🔄 Повторить", callback_data=f"acc:scan_api:{login}")],
+                [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")]]))
+    except Exception:
+        # Fallback без Markdown
         try:
             await q.edit_message_text(text[:4000], parse_mode=None,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")]
-                ]))
+                    [InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")]]))
         except Exception:
             pass
 

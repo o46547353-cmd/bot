@@ -114,7 +114,7 @@ class SlashThreadsClient:
               base_url: str = None) -> dict:
         url = f'{base_url or BASE_URL}{path}'
         body = self._signed_body(data) if signed and data else (data or {})
-        r = self.session.post(url, data=body, timeout=30)
+        r = self.session.post(url, data=body, timeout=15, allow_redirects=False)
         r.raise_for_status()
         try:
             return r.json()
@@ -125,7 +125,7 @@ class SlashThreadsClient:
     def _get(self, path: str, params: dict = None,
              base_url: str = None) -> dict:
         url = f'{base_url or BASE_URL}{path}'
-        r = self.session.get(url, params=params, timeout=30)
+        r = self.session.get(url, params=params, timeout=15, allow_redirects=False)
         r.raise_for_status()
         try:
             return r.json()
@@ -144,7 +144,8 @@ class SlashThreadsClient:
         # Тест 1: threads.net /users/search/
         url1 = f'{BASE_URL}/users/search/'
         try:
-            r = self.session.get(url1, params={'q': query, 'count': 10}, timeout=15)
+            r = self.session.get(url1, params={'q': query, 'count': 10},
+                                 timeout=8, allow_redirects=False)
             results['threads.net /users/search/'] = {
                 'status': r.status_code,
                 'body':   r.text[:300],
@@ -155,7 +156,8 @@ class SlashThreadsClient:
         # Тест 2: i.instagram.com /users/search/
         url2 = f'https://i.instagram.com/api/v1/users/search/'
         try:
-            r = self.session.get(url2, params={'q': query, 'count': 10}, timeout=15)
+            r = self.session.get(url2, params={'q': query, 'count': 10},
+                                 timeout=8, allow_redirects=False)
             results['i.instagram.com /users/search/'] = {
                 'status': r.status_code,
                 'body':   r.text[:300],
@@ -166,7 +168,8 @@ class SlashThreadsClient:
         # Тест 3: threads.net /text_feed/recommended_users/
         url3 = f'{BASE_URL}/text_feed/recommended_users/'
         try:
-            r = self.session.get(url3, params={'search_query': query}, timeout=15)
+            r = self.session.get(url3, params={'search_query': query},
+                                 timeout=8, allow_redirects=False)
             results['threads.net /recommended_users/'] = {
                 'status': r.status_code,
                 'body':   r.text[:300],
@@ -174,7 +177,7 @@ class SlashThreadsClient:
         except Exception as e:
             results['threads.net /recommended_users/'] = {'status': 0, 'body': str(e)[:300]}
 
-        # Тест 4: Auth info
+        # Auth info
         auth_info = {
             'has_bearer':  'Authorization' in self.session.headers,
             'has_session':  bool(self.session.cookies.get('sessionid')),
@@ -190,17 +193,15 @@ class SlashThreadsClient:
         """Тестирует получение ленты."""
         uid = user_id or self.user_id
         results = {}
-
         url = f'{BASE_URL}/text_feed/{uid}/profile/'
         try:
-            r = self.session.get(url, timeout=15)
+            r = self.session.get(url, timeout=8, allow_redirects=False)
             results[f'/text_feed/{uid}/profile/'] = {
                 'status': r.status_code,
                 'body':   r.text[:400],
             }
         except Exception as e:
             results[f'/text_feed/{uid}/profile/'] = {'status': 0, 'body': str(e)[:300]}
-
         return results
 
     # ══════════════════════════════════════════════════════════════════════════
