@@ -1,21 +1,13 @@
-# Telegram
+# Telegram (тянет httpx + httpcore нужных версий сам)
 python-telegram-bot[job-queue]==21.10
 
 # Scheduler
 apscheduler>=3.10.0
 
-# HTTP — совместимые версии для PTB + metathreads
-httpx>=0.27,<0.29
-h11>=0.14.0
-httpcore>=1.0.0,<2.0.0
-
-# Threads API (metathreads — лайки, фолловы, реплаи, поиск, статистика)
-metathreads
-
-# Instagram auth + image posting (заменяет Danie1/threads-api)
+# Instagram auth + image posting (заменяет Danie1)
 instagrapi>=2.1.2
 
-# TOTP — автогенерация 2FA кодов из Google Authenticator seed
+# TOTP — автогенерация 2FA кодов
 pyotp>=2.9.0
 
 # AI
@@ -26,7 +18,3 @@ python-dotenv
 requests
 cryptography
 pytz
-
-# metathreads dependencies
-beautifulsoup4
-lxml
