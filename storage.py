@@ -110,6 +110,13 @@ CREATE TABLE IF NOT EXISTS post_stats (
     checked_at TEXT,
     hours_after INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS pending_2fa (
+    login TEXT PRIMARY KEY,
+    password TEXT DEFAULT '',
+    method TEXT DEFAULT 'instagrapi',
+    tf_id TEXT DEFAULT '',
+    created_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_archive_posted ON archive(posted_at);
 CREATE INDEX IF NOT EXISTS idx_post_stats_login ON post_stats(account_login);
 CREATE INDEX IF NOT EXISTS idx_monitor_comment ON monitor_log(comment_id);
@@ -307,3 +314,22 @@ def get_post_stats(account_login, limit=10):
     return [{'post_id': r[0], 'topic': r[1], 'likes': r[2], 'replies': r[3],
              'reposts': r[4], 'checked_at': r[5], 'hours_after': r[6]}
             for r in rows]
+
+
+# --- Pending 2FA ---
+def save_pending_2fa(login: str, password: str, method: str = 'instagrapi', tf_id: str = ''):
+    _execute(
+        'INSERT OR REPLACE INTO pending_2fa(login,password,method,tf_id,created_at) VALUES(?,?,?,?,?)',
+        (login, password, method, tf_id, datetime.now().isoformat())
+    )
+
+
+def get_pending_2fa(login: str):
+    row = _fetchone('SELECT login,password,method,tf_id,created_at FROM pending_2fa WHERE login=?', (login,))
+    if not row:
+        return None
+    return {'login': row[0], 'password': row[1], 'method': row[2], 'tf_id': row[3], 'created_at': row[4]}
+
+
+def delete_pending_2fa(login: str):
+    _execute('DELETE FROM pending_2fa WHERE login=?', (login,))
