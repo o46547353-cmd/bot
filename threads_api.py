@@ -287,24 +287,37 @@ def _ig_post_text(ig_cl, caption: str, reply_to: str = None) -> str:
 # ══════════════════════════════════════════════════════════════
 
 def _post_with_reply_metathreads(client, caption: str, reply_to: str = None) -> dict:
-    from metathreads.constants import Setting, Path
+    from metathreads.constants import Path
     from metathreads.request_util import generate_request_data
 
-    upload_id = int(datetime.datetime.now().microsecond * datetime.datetime.now().microsecond)
+    # user_id берём из logged_in_user — у MetaThreads нет прямого атрибута user_id
+    user = client.logged_in_user or {}
+    uid  = str(user.get('pk') or user.get('id') or '')
+
+    # Setting.ANDROID_ID/DEVICE_ID могут отсутствовать в старых версиях metathreads
+    try:
+        from metathreads.constants import Setting
+        android_id = getattr(Setting, 'ANDROID_ID', 'android-' + uid[:8])
+        device_uuid = getattr(Setting, 'DEVICE_ID', uid or 'device-uuid')
+    except Exception:
+        android_id  = 'android-' + uid[:8]
+        device_uuid = uid or 'device-uuid'
+
+    upload_id = int(datetime.datetime.now().timestamp() * 1000) % (10 ** 9)
     text_post_info: dict = {'reply_control': 0}
     if reply_to:
         text_post_info['reply_id'] = str(reply_to)
 
     data = {
-        'publish_mode': 'text_post',
-        'upload_id': upload_id,
+        'publish_mode':      'text_post',
+        'upload_id':         upload_id,
         'text_post_app_info': text_post_info,
-        'timezone_offset': 0,
-        '_uid': client.user_id,
-        'device_id': Setting.ANDROID_ID,
-        '_uuid': Setting.DEVICE_ID,
-        'caption': caption,
-        'audience': 'default',
+        'timezone_offset':   0,
+        '_uid':              uid,
+        'device_id':         android_id,
+        '_uuid':             device_uuid,
+        'caption':           caption,
+        'audience':          'default',
     }
     signed_data = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
     _activate_client(client)
@@ -598,6 +611,7 @@ async def post_series_async(posts: dict, image_path: str = None,
 
     async def _post_text(caption: str, reply_to: str = None) -> str:
         """Публикует текстовый пост: metathreads → fallback instagrapi."""
+        mt_err = ig_err = None
         if mt_client:
             try:
                 r = await asyncio.to_thread(
@@ -606,8 +620,10 @@ async def post_series_async(posts: dict, image_path: str = None,
                 pk = _pk(r)
                 if pk:
                     return pk
+                logger.warning(f"[{login}] metathreads вернул пустой pk, r={r}")
             except Exception as e:
-                logger.warning(f"[{login}] metathreads text post: {e}")
+                mt_err = str(e)
+                logger.warning(f"[{login}] metathreads text post: {e}", exc_info=True)
         # fallback: instagrapi
         if ig_client:
             try:
@@ -616,9 +632,14 @@ async def post_series_async(posts: dict, image_path: str = None,
                 )
                 if pk:
                     return pk
+                logger.warning(f"[{login}] instagrapi вернул пустой pk")
             except Exception as e:
-                logger.warning(f"[{login}] instagrapi text post: {e}")
-        raise Exception(f"Не удалось опубликовать пост (оба метода упали)")
+                ig_err = str(e)
+                logger.warning(f"[{login}] instagrapi text post: {e}", exc_info=True)
+        raise Exception(
+            f"Не удалось опубликовать пост (оба метода упали). "
+            f"metathreads: {mt_err}. instagrapi: {ig_err}"
+        )
 
     ids = []
 
