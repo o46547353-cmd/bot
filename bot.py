@@ -179,13 +179,24 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wp    = "🟢 Вкл" if acc.get('warmup_active')  else "⚫ Выкл"
         ap    = "🟢 Вкл" if acc.get('autopost_active') else "⚫ Выкл"
         img   = "🖼✅" if storage.get_image(login) else "🖼❌"
-        tok   = "🔑✅" if storage.get_setting(f'threads_api_token:{login}') else "🔑❌"
+        has_token = bool(storage.get_setting(f'threads_api_token:{login}'))
+        # Hybrid = токен есть И metathreads-клиент активен в памяти
+        try:
+            mt_active = threads_api.get_client(login)['client'] is not None
+        except Exception:
+            mt_active = False
+        if has_token and mt_active:
+            tok_status = "🔑✅ hybrid"
+        elif has_token:
+            tok_status = "🔑⚠️ token only"
+        else:
+            tok_status = "🔑❌"
         has_ap = bool((acc.get('account_prompt') or '').strip())
         has_tp = bool((acc.get('topic_prompt') or '').strip())
         text = (
             f"*@{acc.get('username', login)}*\n\n"
             f"Прогрев: {wp}  |  Автопостинг: {ap}\n"
-            f"{img} Картинка  {tok} Danie1 token\n"
+            f"{img} Картинка  {tok_status} токен\n"
             f"📝 Системный промпт: {'✅' if has_ap else '⚫ дефолтный'}\n"
             f"💡 Промпт тем: {'✅' if has_tp else '⚫ дефолтный'}\n\n"
             f"В очереди: {storage.count(login)}  |  Пресет: {acc.get('warmup_preset', 'A')}\n"
@@ -193,18 +204,25 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         toggle_w = "⏹ Стоп прогрев"  if acc.get('warmup_active')  else "▶️ Старт прогрев"
         toggle_a = "⏹ Стоп постинг"  if acc.get('autopost_active') else "▶️ Старт постинг"
-        await q.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([
+        # Кнопка обновления токена: всегда видна для danie1, для остальных — только если токен есть
+        show_refresh = (acc.get('auth_type') == 'danie1') or has_token
+        rows = [
             [InlineKeyboardButton(toggle_w, callback_data=f"acc:toggle_w:{login}"),
              InlineKeyboardButton(toggle_a, callback_data=f"acc:toggle_a:{login}")],
             [InlineKeyboardButton("🎲 Авто-серия",  callback_data=f"acc:autoseriya:{login}"),
              InlineKeyboardButton("📋 Очередь",     callback_data=f"acc:queue:{login}")],
             [InlineKeyboardButton("▶️ Пост сейчас", callback_data=f"acc:postnow:{login}")],
             [InlineKeyboardButton("🖼 Загрузить картинку",     callback_data=f"acc:upload_img:{login}")],
+        ]
+        if show_refresh:
+            rows.append([InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
+        rows += [
             [InlineKeyboardButton("✏️ Системный промпт",       callback_data=f"acc:edit_aprompt:{login}"),
              InlineKeyboardButton("💡 Промпт тем",             callback_data=f"acc:edit_tprompt:{login}")],
             [InlineKeyboardButton("📋 Показать промпты",       callback_data=f"acc:show_prompts:{login}")],
             [InlineKeyboardButton("◀️ Назад",                  callback_data="menu:accounts")],
-        ]))
+        ]
+        await q.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(rows))
 
     elif action == 'toggle_w':
         login = parts[2]; acc = storage.get_account(login)
@@ -310,6 +328,23 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         ctx.user_data['_conv_state'] = 'edit_topic_prompt'
+
+    elif action == 'refresh_token':
+        login = parts[2]
+        acc   = storage.get_account(login)
+        if not acc:
+            await q.edit_message_text("Аккаунт не найден."); return
+        ctx.user_data['_conv_state']         = 'refresh_token'
+        ctx.user_data['refresh_token_login'] = login
+        await q.edit_message_text(
+            f"🔄 *Обновление токена для @{acc.get('username', login)}*\n\n"
+            f"Отправь пароль от Instagram-аккаунта `{login}`.\n\n"
+            f"Бот залогинится через Danie1 и обновит Bearer-токен — "
+            f"после этого все функции (лайки, прогрев, репосты) снова заработают.\n\n"
+            f"⚠️ Пароль нигде не сохраняется — используется только для получения токена.\n\n"
+            f"/cancel — отмена",
+            parse_mode='Markdown'
+        )
 
     elif action == 'show_prompts':
         login = parts[2]
@@ -881,6 +916,7 @@ async def conv_cancel(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop('edit_prompt_login', None)
     ctx.user_data.pop('_waiting_photo_for', None)
     ctx.user_data.pop('img_login', None)
+    ctx.user_data.pop('refresh_token_login', None)
     await upd.message.reply_text("Отменено.", reply_markup=kb_main())
     return ConversationHandler.END
 
@@ -912,6 +948,51 @@ async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE)
                 [InlineKeyboardButton("📋 Посмотреть промпты",  callback_data=f"acc:show_prompts:{login}")],
                 [InlineKeyboardButton("👤 К аккаунту",          callback_data=f"acc:manage:{login}")],
             ]))
+
+    elif state == 'refresh_token':
+        login    = ctx.user_data.pop('refresh_token_login', None)
+        password = text
+        ctx.user_data.pop('_conv_state', None)
+        if not login:
+            await upd.message.reply_text("❌ Сессия не найдена, попробуй снова.", reply_markup=kb_main())
+            return
+        acc = storage.get_account(login)
+        uname = acc.get('username', login) if acc else login
+        await upd.message.reply_text(f"⏳ Обновляю токен для *@{uname}*...", parse_mode='Markdown')
+        try:
+            ok = await threads_api.login_danie1(login, password)
+            if ok:
+                # Проверяем hybrid-статус
+                try:
+                    mt_active = threads_api.get_client(login)['client'] is not None
+                except Exception:
+                    mt_active = False
+                mode = "hybrid ✅ (metathreads + Danie1)" if mt_active else "Danie1-only ⚠️"
+                await upd.message.reply_text(
+                    f"✅ Токен обновлён для *@{uname}*\n\nРежим: {mode}\n\n"
+                    f"Теперь лайки, прогрев и репосты работают в полную силу.",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")
+                    ]])
+                )
+            else:
+                await upd.message.reply_text(
+                    f"❌ Не удалось обновить токен для *@{uname}*\n\n"
+                    f"Проверь пароль или подожди 15-30 минут (Instagram временно блокирует).",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"acc:refresh_token:{login}"),
+                        InlineKeyboardButton("◀️ К аккаунту",        callback_data=f"acc:manage:{login}"),
+                    ]])
+                )
+        except Exception as e:
+            await upd.message.reply_text(
+                f"❌ Ошибка: {e}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")
+                ]])
+            )
 
     elif state == 'edit_topic_prompt':
         acc = storage.get_account(login)

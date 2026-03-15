@@ -10,6 +10,12 @@ from metathreads import MetaThreads, config
 
 logger = logging.getLogger(__name__)
 
+
+class BloksLoginFailed(Exception):
+    """Ошибка входа через Bloks (metathreads). Вызывающий код может попробовать Danie1."""
+    pass
+
+
 LOGIN_TIMEOUT = 30   # секунды
 MAX_RETRIES   = 3
 RETRY_DELAY   = 5    # секунд между попытками
@@ -44,10 +50,10 @@ def login(username: str, password: str) -> dict:
             last_err = e
             err = str(e).lower()
 
-            # Ошибки при которых повтор не поможет
+            # Ошибки при которых повтор не поможет (Bloks API) — вызывающий код может попробовать Danie1
             if "login failed" in err or "login_failed" in err:
-                raise Exception(
-                    "Неверный логин или пароль.\n\n"
+                raise BloksLoginFailed(
+                    "Неверный логин или пароль (Bloks).\n\n"
                     "Если пароль точно верный:\n"
                     "• Подожди 15-30 минут (Instagram временно блокирует)\n"
                     "• Или используй /manual_cookies"

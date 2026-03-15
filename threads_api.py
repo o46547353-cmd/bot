@@ -15,10 +15,11 @@ import os, time, random, logging, datetime, json, asyncio
 from dotenv import load_dotenv
 import storage
 import threads_auth
-from threads_auth import TwoFactorRequired
+from threads_auth import TwoFactorRequired, BloksLoginFailed
 
 AUTH_TYPE_BLOKS  = 'bloks'
 AUTH_TYPE_COOKIE = 'cookie'
+AUTH_TYPE_DANIE1 = 'danie1'
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -195,10 +196,47 @@ def _make_metathreads_client(session_id: str, csrf_token: str,
     return client
 
 
+def _make_metathreads_from_danie1_token(token: str, user_id: str, username: str):
+    """
+    Создаём metathreads-клиент из Danie1 Bearer-токена.
+    Danie1 хранит сырой токен; metathreads принимает его через Authorization header
+    в формате 'Bearer IGT:2:<token>' — тот же формат, что использует Bloks.
+    Это даёт аккаунту полный функционал обеих библиотек.
+    """
+    from metathreads import MetaThreads
+    client = MetaThreads()
+    client.session.headers.update({'Authorization': f'Bearer IGT:2:{token}'})
+    client.logged_in_user = {'pk': user_id, 'username': username}
+    logger.debug(f"metathreads-клиент из Danie1-токена: user_id={user_id}, username={username}")
+    return client
+
+
 def load_accounts_from_db():
     for acc_ref in storage.get_all_accounts():
         acc = storage.get_account(acc_ref['login'])
-        if acc and acc.get('session_id'):
+        if not acc:
+            continue
+        if acc.get('auth_type') == AUTH_TYPE_DANIE1:
+            # Восстанавливаем metathreads-клиент из сохранённого Danie1-токена
+            mt_client = None
+            token = storage.get_setting(f'threads_api_token:{acc["login"]}')
+            if token and acc.get('user_id') and acc.get('username'):
+                try:
+                    mt_client = _make_metathreads_from_danie1_token(
+                        token, acc['user_id'], acc['username']
+                    )
+                except Exception as e:
+                    logger.warning(f"metathreads из токена ({acc['login']}): {e}")
+            _clients[acc['login']] = {
+                'client':   mt_client,
+                'username': acc.get('username', acc['login']),
+                'user_id':  acc.get('user_id', acc['login']),
+                'login':    acc['login'],
+            }
+            mode = 'hybrid ✓' if mt_client else 'Danie1-only'
+            logger.info(f"Загружен ({mode}): {acc['login']}")
+            continue
+        if acc.get('session_id'):
             try:
                 client = _make_metathreads_client(
                     acc['session_id'], acc['csrf_token'],
@@ -229,6 +267,9 @@ def add_account(login: str, password: str) -> dict:
     except TwoFactorRequired:
         _pending_2fa[login] = {'login': login, 'password': password}
         raise
+    except BloksLoginFailed as e:
+        logger.warning(f"[{login}] Bloks login failed, пробую Danie1: {e}")
+        return _add_account_via_danie1(login, password)
 
 
 def confirm_2fa(login, code):
@@ -242,6 +283,64 @@ def confirm_2fa(login, code):
     except Exception as e:
         _pending_2fa[login] = pending
         raise Exception(f"2FA не подтверждена: {e}\n\nДля аккаунтов с 2FA используй /manual_cookies")
+
+
+def _add_account_via_danie1(login: str, password: str) -> dict:
+    """Вход через Danie1/threads-api когда Bloks вернул login failed. Вызывается из sync add_account."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_add_account_danie1_async(login, password))
+        finally:
+            loop.close()
+    except Exception as e:
+        raise Exception(
+            f"Danie1 тоже не смог войти: {e}\n\n"
+            "Если пароль верный:\n"
+            "• Подожди 15-30 минут (Instagram блокирует)\n"
+            "• Или используй /manual_cookies"
+        )
+
+
+async def _add_account_danie1_async(login: str, password: str) -> dict:
+    """Логин через Danie1 + создание metathreads-клиента из того же токена (hybrid mode)."""
+    from threads_api.src.threads_api import ThreadsAPI
+    api = ThreadsAPI()
+    ok = await api.login(login, password)
+    if not ok or not getattr(api, 'token', None):
+        raise Exception("Danie1: неверный логин или пароль, либо Instagram временно блокирует.")
+    token    = api.token
+    user_id  = str(getattr(api, 'user_id', None) or '')
+    username = str(getattr(api, 'username', None) or login)
+
+    storage.set_setting(f'threads_api_token:{login}', token)
+
+    # Создаём metathreads-клиент из того же Bearer-токена — аккаунт получает полный функционал
+    mt_client = None
+    try:
+        mt_client = _make_metathreads_from_danie1_token(token, user_id or login, username)
+        logger.info(f"[{login}] metathreads hybrid-клиент создан ✓")
+    except Exception as e:
+        logger.warning(f"[{login}] metathreads из токена не создан (продолжаем только с Danie1): {e}")
+
+    _clients[login] = {
+        'client':   mt_client,   # не None если токен пробросился в metathreads
+        'username': username,
+        'user_id':  user_id or login,
+        'login':    login,
+    }
+    storage.save_account({
+        'login':      login,
+        'session_id': token,
+        'csrf_token': '',
+        'user_id':    user_id or login,
+        'username':   username,
+        'auth_type':  AUTH_TYPE_DANIE1,
+    })
+    mode = 'hybrid' if mt_client else 'Danie1-only'
+    logger.info(f"[{login}] Добавлен через Danie1 ({mode}). username={username}")
+    return {'login': login, 'username': username}
 
 
 def add_account_manual(login, session_id, csrf_token):
@@ -367,13 +466,28 @@ def list_accounts() -> list:
 
 
 async def login_danie1(login: str, password: str) -> bool:
-    """Получаем Bearer token Danie1 для image-постинга."""
+    """Получаем Bearer token Danie1 для image-постинга + обновляем metathreads hybrid-клиент."""
     try:
         from threads_api.src.threads_api import ThreadsAPI
         api = ThreadsAPI()
         ok  = await api.login(login, password)
         if ok and api.token:
-            storage.set_setting(f'threads_api_token:{login}', api.token)
+            token    = api.token
+            user_id  = str(getattr(api, 'user_id', None) or '')
+            username = str(getattr(api, 'username', None) or login)
+            storage.set_setting(f'threads_api_token:{login}', token)
+
+            # Обновляем metathreads-клиент в памяти если аккаунт уже загружен
+            try:
+                mt_client = _make_metathreads_from_danie1_token(
+                    token, user_id or login, username
+                )
+                if login in _clients:
+                    _clients[login]['client'] = mt_client
+                    logger.info(f"[{login}] metathreads hybrid-клиент обновлён ✓")
+            except Exception as e:
+                logger.warning(f"[{login}] metathreads обновить не удалось: {e}")
+
             logger.info(f"[{login}] Danie1 Bearer token сохранён")
             return True
         return False
@@ -408,7 +522,12 @@ async def post_series_async(posts: dict, image_path: str = None,
         except Exception as e:
             logger.warning(f"[{login}] Danie1 упал ({e}), переключаюсь на metathreads...")
 
-    # 2. Fallback: metathreads (без картинки, но с reply_to)
+    # 2. Fallback: metathreads (если аккаунт не только Danie1)
+    if mt_client is None:
+        raise Exception(
+            "Аккаунт добавлен через Danie1; токен истёк или недоступен. "
+            "Используй /add_account с паролем заново или /manual_cookies."
+        )
     try:
         ids = await _post_series_metathreads(mt_client, posts, login)
         logger.info(f"[{login}] ✓ Опубликовано через metathreads")
@@ -493,14 +612,18 @@ def _with_fallback(login: str, mt_fn, d1_fn=None, fn_name: str = ''):
     """
     Универсальный враппер с авто-фоллбэком.
     Сначала пробует metathreads, при ошибке — Danie1 (если d1_fn задан).
+    Для аккаунтов только Danie1 (client is None) сразу идём в Danie1.
     """
     entry = get_client(login)
-    # Попытка 1: metathreads
-    try:
-        _activate_client(entry['client'])
-        return mt_fn(entry['client'])
-    except Exception as e:
-        logger.warning(f"{fn_name}({login}) metathreads: {e}")
+    mt_client = entry['client']
+
+    # Попытка 1: metathreads (если есть клиент)
+    if mt_client is not None:
+        try:
+            _activate_client(mt_client)
+            return mt_fn(mt_client)
+        except Exception as e:
+            logger.warning(f"{fn_name}({login}) metathreads: {e}")
 
     # Попытка 2: Danie1
     if d1_fn:
