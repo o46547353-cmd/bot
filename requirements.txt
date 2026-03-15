@@ -18,3 +18,7 @@ python-dotenv
 requests
 cryptography
 pytz
+
+# metathreads dependencies (ставятся ДО metathreads --no-deps в Dockerfile)
+beautifulsoup4
+lxml
