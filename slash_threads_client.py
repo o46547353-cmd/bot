@@ -37,6 +37,11 @@ BASE_HEADERS = {
 }
 
 
+class AuthExpired(Exception):
+    """Bearer token протух — нужен перелогин."""
+    pass
+
+
 class SlashThreadsClient:
 
     def __init__(self, user_id: str = '', username: str = ''):
@@ -46,6 +51,8 @@ class SlashThreadsClient:
         self.username = username
         self._device_id   = f'android-{uuid.uuid4().hex[:16]}'
         self._device_uuid = str(uuid.uuid4())
+        # Отдельная сессия для Instagram private API (upload, feed)
+        self.ig_session = None  # requests.Session from instagrapi
 
     # ── Фабрики ──────────────────────────────────────────────────────────────
 
@@ -70,7 +77,7 @@ class SlashThreadsClient:
 
     @classmethod
     def from_instagrapi(cls, ig_client, user_id: str = '', username: str = ''):
-        """Создать из instagrapi.Client — берём Bearer + cookies + device IDs."""
+        """Создать из instagrapi.Client — берём Bearer + cookies + device IDs + ig session."""
         c = cls(user_id, username)
 
         # Bearer token
@@ -103,6 +110,12 @@ class SlashThreadsClient:
         except Exception:
             pass
 
+        # Сохраняем instagrapi private session для upload/feed
+        try:
+            c.ig_session = ig_client.private
+        except Exception:
+            pass
+
         return c
 
     # ── HTTP ─────────────────────────────────────────────────────────────────
@@ -114,7 +127,10 @@ class SlashThreadsClient:
               base_url: str = None) -> dict:
         url = f'{base_url or BASE_URL}{path}'
         body = self._signed_body(data) if signed and data else (data or {})
-        r = self.session.post(url, data=body, timeout=15, allow_redirects=False)
+        timeout = 30 if 'configure' in path else 15
+        r = self.session.post(url, data=body, timeout=timeout, allow_redirects=False)
+        if r.status_code in (400, 403):
+            raise AuthExpired(f"{r.status_code} POST {path}")
         r.raise_for_status()
         try:
             return r.json()
@@ -126,11 +142,57 @@ class SlashThreadsClient:
              base_url: str = None) -> dict:
         url = f'{base_url or BASE_URL}{path}'
         r = self.session.get(url, params=params, timeout=15, allow_redirects=False)
+        if r.status_code in (400, 403):
+            raise AuthExpired(f"{r.status_code} GET {path}")
         r.raise_for_status()
         try:
             return r.json()
         except Exception:
             logger.warning(f"GET {path}: не JSON ({r.status_code})")
+            return {}
+
+    def _graphql(self, doc_id: str, variables: dict) -> dict:
+        """
+        GraphQL запрос к threads.net/api/graphql.
+        Не требует Bearer — только x-ig-app-id + web user-agent.
+        ВАЖНО: используем чистый requests.post() без self.session
+        (чтобы не отправлять Android-заголовки и Bearer).
+        """
+        url = 'https://www.threads.net/api/graphql'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'X-IG-App-ID': THREADS_APP_ID,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://www.threads.net',
+            'Referer': 'https://www.threads.net/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+        }
+        try:
+            # Чистый requests.post — не self.session!
+            r = requests.post(url, data={
+                'variables': json.dumps(variables),
+                'doc_id': doc_id,
+            }, headers=headers, timeout=15)
+            # Проверяем что ответ — JSON, а не HTML
+            ct = r.headers.get('content-type', '')
+            if 'html' in ct or r.text.strip().startswith('<!'):
+                logger.warning(f"graphql doc_id={doc_id}: HTML response ({r.status_code})")
+                return {}
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and ('data' in data or 'errors' in data):
+                return data
+            return data
+        except requests.exceptions.JSONDecodeError:
+            body = r.text[:100] if r else ''
+            logger.warning(f"graphql doc_id={doc_id}: не JSON ({r.status_code}, body={body})")
+            return {}
+        except Exception as e:
+            logger.warning(f"graphql doc_id={doc_id}: {e}")
             return {}
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -230,6 +292,11 @@ class SlashThreadsClient:
 
     def post_image_thread(self, caption: str, image_path: str,
                           reply_to: str = None) -> str:
+        """
+        Опубликовать пост с изображением.
+        Весь процесс через ig_session (instagrapi private) — и upload и configure.
+        Это решает 412/500 — сессия единая.
+        """
         upload_id = str(int(time.time() * 1000))
 
         with open(image_path, 'rb') as f:
@@ -242,30 +309,58 @@ class SlashThreadsClient:
                 'num_reupload': 0, 'num_step_auto_retry': 0, 'num_step_manual_retry': 0,
             }),
         })
-        # Фото загружается через Instagram
+
+        # Нужен ig_session для upload+configure
+        ig = self.ig_session
+        if not ig:
+            raise Exception("ig_session не доступна — нужен instagrapi логин для image posting")
+
+        # Step 1: Upload через Instagram
         upload_url = f'https://i.instagram.com/rupload_igphoto/{upload_id}'
-        r = self.session.post(upload_url, data=photo_data, headers={
+        r = ig.post(upload_url, data=photo_data, headers={
             'X-Entity-Type': 'image/jpeg', 'Offset': '0',
             'X-Instagram-Rupload-Params': rupload_params,
             'X-Entity-Name': f'fb_uploader_{upload_id}',
             'X-Entity-Length': str(len(photo_data)),
             'Content-Type': 'application/octet-stream',
         }, timeout=60)
+        if r.status_code in (403, 412):
+            raise AuthExpired(f"{r.status_code} rupload_igphoto")
         r.raise_for_status()
+        logger.debug(f"Photo uploaded: {r.json()}")
 
+        # Step 2: Configure через Instagram (не threads.net!)
         text_post_info = {'reply_control': 0}
         if reply_to:
             text_post_info['reply_id'] = str(reply_to)
 
-        data = {
-            'caption': caption, 'upload_id': upload_id,
+        configure_data = {
+            'caption': caption,
+            'upload_id': upload_id,
             'publish_mode': 'media_post',
             'text_post_app_info': json.dumps(text_post_info),
-            'timezone_offset': '0', 'audience': 'default',
-            '_uid': self.user_id, '_uuid': self._device_uuid, 'device_id': self._device_id,
+            'timezone_offset': '0',
+            'source_type': '4',
+            'audience': 'default',
+            '_uid': self.user_id,
+            '_uuid': self._device_uuid,
+            'device_id': self._device_id,
+            'device': json.dumps({
+                'manufacturer': 'OnePlus',
+                'model': 'ONEPLUS A6013',
+                'android_version': 28,
+                'android_release': '9.0',
+            }),
         }
-        resp = self._post('/media/configure_text_post_app_feed/', data, signed=True)
-        return self._extract_pk(resp)
+        signed = {'signed_body': f'SIGNATURE.{json.dumps(configure_data)}'}
+
+        configure_url = 'https://www.threads.net/api/v1/media/configure_text_post_app_feed/'
+        r2 = ig.post(configure_url, data=signed, timeout=30)
+        if r2.status_code in (403, 412):
+            raise AuthExpired(f"{r2.status_code} configure_image")
+        r2.raise_for_status()
+        result = r2.json()
+        return self._extract_pk(result)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  ДЕЙСТВИЯ
@@ -277,6 +372,8 @@ class SlashThreadsClient:
                 'media_id': media_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"like({media_id}): {e}")
             return False
@@ -287,6 +384,8 @@ class SlashThreadsClient:
                 'media_id': media_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception:
             return False
 
@@ -296,6 +395,8 @@ class SlashThreadsClient:
                 'media_id': media_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"repost({media_id}): {e}")
             return False
@@ -306,6 +407,8 @@ class SlashThreadsClient:
                 'media_id': media_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception:
             return False
 
@@ -315,6 +418,8 @@ class SlashThreadsClient:
                 'user_id': user_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"follow({user_id}): {e}")
             return False
@@ -325,6 +430,8 @@ class SlashThreadsClient:
                 'user_id': user_id, '_uid': self.user_id, '_uuid': self._device_uuid,
             }, signed=True)
             return True
+        except AuthExpired:
+            raise
         except Exception:
             return False
 
@@ -336,8 +443,24 @@ class SlashThreadsClient:
         try:
             resp = self._get('/users/search/', params={'q': query, 'count': count})
             return resp.get('users', [])
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"search_users({query}): {e}")
+            return []
+
+    def get_recommended_users(self, search_query: str = '') -> list:
+        """Получить рекомендованных юзеров (работает даже когда search пуст)."""
+        try:
+            params = {}
+            if search_query:
+                params['search_query'] = search_query
+            resp = self._get('/text_feed/recommended_users/', params=params or None)
+            return resp.get('users', [])
+        except AuthExpired:
+            raise
+        except Exception as e:
+            logger.warning(f"get_recommended_users: {e}")
             return []
 
     def get_user_id(self, username: str) -> str:
@@ -345,6 +468,8 @@ class SlashThreadsClient:
             resp = self._get('/users/web_profile_info/', params={'username': username})
             user = resp.get('data', {}).get('user', {})
             return str(user.get('pk', '') or user.get('id', ''))
+        except AuthExpired:
+            raise
         except Exception:
             users = self.search_users(username, count=5)
             for u in users:
@@ -356,21 +481,141 @@ class SlashThreadsClient:
         try:
             resp = self._get('/users/web_profile_info/', params={'username': username})
             return resp.get('data', {}).get('user', {})
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"get_user_info({username}): {e}")
             return {}
 
+    # ── GraphQL doc_id (threads-re reverse engineering) ─────────────────────
+    GQL_USER_POSTS   = '6232751443445612'  # userID → посты
+    GQL_USER_PROFILE = '23996318473300828'  # userID → профиль
+    GQL_USER_REPLIES = '6307072669391286'  # userID → ответы
+    GQL_POST         = '5587632691339264'  # postID → пост
+    GQL_POST_LIKERS  = '9360915773983802'  # mediaID → кто лайкнул
+
     def get_user_threads(self, user_id: str) -> list:
+        """Получить посты пользователя через GraphQL (основной) → REST fallback."""
+        # Способ 1: GraphQL (не требует Bearer, самый надёжный)
+        try:
+            resp = self._graphql(self.GQL_USER_POSTS, {'userID': user_id})
+            posts = self._parse_graphql_threads(resp)
+            if posts:
+                logger.debug(f"get_user_threads({user_id}): graphql ✓ ({len(posts)})")
+                return posts
+        except Exception as e:
+            logger.debug(f"get_user_threads graphql: {e}")
+
+        # Способ 2: REST text_feed (может быть 403)
         try:
             resp = self._get(f'/text_feed/{user_id}/profile/')
-            return self._parse_threads(resp)
+            posts = self._parse_threads(resp)
+            if posts:
+                return posts
+        except AuthExpired:
+            raise
+        except Exception:
+            pass
+
+        # Способ 3: Instagram private API через ig_session
+        if self.ig_session:
+            try:
+                url = f'https://i.instagram.com/api/v1/text_feed/{user_id}/profile/'
+                r = self.ig_session.get(url, timeout=15)
+                if r.status_code == 200:
+                    resp = r.json()
+                    posts = self._parse_threads(resp)
+                    if posts:
+                        return posts
+            except Exception:
+                pass
+
+        return []
+
+    def get_timeline(self) -> list:
+        """Получить домашнюю ленту — посты для лайков."""
+        # Способ 1: Threads API
+        try:
+            resp = self._post('/feed/timeline/', {
+                'reason': 'cold_start_fetch',
+                '_uid': self.user_id,
+                '_uuid': self._device_uuid,
+            }, signed=True)
+            items = resp.get('feed_items', []) or resp.get('items', [])
+            posts = []
+            for item in items:
+                if isinstance(item, dict):
+                    post = item.get('media_or_ad', item)
+                    pk = post.get('pk') or post.get('id')
+                    if pk:
+                        posts.append(post)
+            if posts:
+                return posts
+        except AuthExpired:
+            pass  # Не raise — пробуем ig_session
+        except Exception:
+            pass
+
+        # Способ 2: Instagram private API
+        if self.ig_session:
+            try:
+                url = 'https://i.instagram.com/api/v1/feed/timeline/'
+                r = self.ig_session.post(url, data={
+                    'reason': 'cold_start_fetch',
+                    '_uid': self.user_id,
+                    '_uuid': self._device_uuid,
+                }, timeout=15)
+                if r.status_code == 200:
+                    resp = r.json()
+                    items = resp.get('feed_items', []) or resp.get('items', [])
+                    posts = []
+                    for item in items:
+                        if isinstance(item, dict):
+                            post = item.get('media_or_ad', item)
+                            pk = post.get('pk') or post.get('id')
+                            if pk:
+                                posts.append(post)
+                    if posts:
+                        logger.info(f"get_timeline: ig_session ✓ ({len(posts)} posts)")
+                        return posts
+            except Exception:
+                pass
+
+        return []
+
+    def get_text_app_explore(self) -> list:
+        """Explore-лента Threads — посты для лайков."""
+        try:
+            resp = self._get('/text_feed/text_app_explore/')
+            items = resp.get('items', []) or resp.get('threads', [])
+            posts = []
+            for item in items:
+                if isinstance(item, dict):
+                    for ti in item.get('thread_items', [item]):
+                        post = ti.get('post', ti) if isinstance(ti, dict) else ti
+                        if isinstance(post, dict) and (post.get('pk') or post.get('id')):
+                            posts.append(post)
+            return posts
+        except AuthExpired:
+            raise
         except Exception as e:
-            logger.warning(f"get_user_threads({user_id}): {e}")
+            logger.warning(f"get_text_app_explore: {e}")
             return []
 
     def get_thread(self, post_id: str) -> dict:
+        """Получить пост по ID — GraphQL → REST fallback."""
+        # GraphQL
+        try:
+            resp = self._graphql(self.GQL_POST, {'postID': post_id})
+            if resp and resp.get('data'):
+                return resp
+        except Exception:
+            pass
+        # REST
         try:
             return self._get(f'/text_feed/{post_id}/replies/')
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"get_thread({post_id}): {e}")
             return {}
@@ -379,13 +624,20 @@ class SlashThreadsClient:
         try:
             resp = self._get(f'/text_feed/{post_id}/replies/')
             return self._parse_replies(resp)
+        except AuthExpired:
+            raise
         except Exception as e:
             logger.warning(f"get_thread_replies({post_id}): {e}")
             return []
 
     def get_thread_stats(self, post_id: str) -> dict:
-        resp = self.get_thread(post_id)
-        return self._parse_stats(resp)
+        try:
+            resp = self.get_thread(post_id)
+            return self._parse_stats(resp)
+        except AuthExpired:
+            raise
+        except Exception:
+            return {}
 
     # ══════════════════════════════════════════════════════════════════════════
     #  ПАРСИНГ
@@ -413,6 +665,34 @@ class SlashThreadsClient:
                 for item in (t.get('thread_items', []) or []):
                     post = item.get('post', item) if isinstance(item, dict) else item
                     if post: posts.append(post)
+        return posts
+
+    @staticmethod
+    def _parse_graphql_threads(resp) -> list:
+        """Парсит ответ GraphQL doc_id=6232751443445612 (user posts)."""
+        if not resp or not isinstance(resp, dict):
+            return []
+        posts = []
+        try:
+            # GraphQL: data.mediaData.threads[].thread_items[].post
+            data = resp.get('data', {})
+            media_data = data.get('mediaData', data)
+            threads = media_data.get('threads', [])
+            if not threads:
+                # Альтернативная структура
+                user = data.get('userData', data).get('user', data)
+                threads = user.get('threads', {}).get('edges', [])
+
+            for t in threads:
+                if isinstance(t, dict):
+                    # Может быть {node: {thread_items: [...]}} или прямо {thread_items: [...]}
+                    node = t.get('node', t)
+                    for item in (node.get('thread_items', []) or []):
+                        post = item.get('post', item) if isinstance(item, dict) else item
+                        if isinstance(post, dict) and (post.get('pk') or post.get('id')):
+                            posts.append(post)
+        except Exception as e:
+            logger.debug(f"_parse_graphql_threads: {e}")
         return posts
 
     @staticmethod

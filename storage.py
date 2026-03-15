@@ -141,6 +141,23 @@ _init_db()
 _migrate_accounts_add_auth_type()
 
 
+def _migrate_accounts_add_credentials():
+    """Добавить колонки password и totp_seed (для авто-перелогина)."""
+    with _lock:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute('PRAGMA table_info(accounts)')
+        columns = [row[1] for row in c.fetchall()]
+        if 'password' not in columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT ''")
+        if 'totp_seed' not in columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN totp_seed TEXT DEFAULT ''")
+        conn.commit()
+
+
+_migrate_accounts_add_credentials()
+
+
 # --- Аккаунты ---
 def get_all_accounts():
     rows = _fetchall('SELECT login FROM accounts')
@@ -185,6 +202,27 @@ def set_warmup_active(login, active: bool):
 
 def set_autopost_active(login, active: bool):
     _execute('UPDATE accounts SET autopost_active=? WHERE login=?', (int(active), login))
+
+
+def set_account_credentials(login, password='', totp_seed=''):
+    """Сохранить пароль и/или TOTP seed для авто-перелогина."""
+    acc = get_account(login)
+    if not acc:
+        return
+    pwd  = password if password else acc.get('password', '')
+    seed = totp_seed if totp_seed else acc.get('totp_seed', '')
+    _execute('UPDATE accounts SET password=?,totp_seed=? WHERE login=?', (pwd, seed, login))
+
+
+def get_account_credentials(login):
+    """Получить пароль и TOTP seed."""
+    acc = get_account(login)
+    if not acc:
+        return None
+    return {
+        'password':  acc.get('password', ''),
+        'totp_seed': acc.get('totp_seed', ''),
+    }
 
 
 # --- Очередь ---

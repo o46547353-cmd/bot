@@ -182,12 +182,19 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             cl_active = False
         cl_status = "🔑✅" if cl_active else "🔑❌"
+        # TOTP статус
+        creds = storage.get_account_credentials(login)
+        has_pwd  = bool(creds and creds.get('password'))
+        has_totp = bool(creds and creds.get('totp_seed'))
+        totp_line = f"🔑 Пароль:{'✅' if has_pwd else '❌'}  TOTP:{'✅' if has_totp else '❌'}"
         has_ap = bool((acc.get('account_prompt') or '').strip())
         has_tp = bool((acc.get('topic_prompt') or '').strip())
+
         text = (
             f"*@{acc.get('username', login)}*\n\n"
             f"Прогрев: {wp}  |  Автопостинг: {ap}\n"
             f"{img} Картинка  {cl_status} API\n"
+            f"{totp_line}\n"
             f"📝 Системный промпт: {'✅' if has_ap else '⚫ дефолтный'}\n"
             f"💡 Промпт тем: {'✅' if has_tp else '⚫ дефолтный'}\n\n"
             f"В очереди: {storage.count(login)}  |  Пресет: {acc.get('warmup_preset', 'A')}\n"
@@ -195,7 +202,6 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         toggle_w = "⏹ Стоп прогрев"  if acc.get('warmup_active')  else "▶️ Старт прогрев"
         toggle_a = "⏹ Стоп постинг"  if acc.get('autopost_active') else "▶️ Старт постинг"
-        # Кнопка обновления токена
         show_refresh = cl_active or (acc.get('auth_type') == 'instagrapi')
         rows = [
             [InlineKeyboardButton(toggle_w, callback_data=f"acc:toggle_w:{login}"),
@@ -207,8 +213,8 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
         rows.append([InlineKeyboardButton("🧪 Тест прогрева",   callback_data=f"acc:test_warmup:{login}"),
                      InlineKeyboardButton("🔬 Скан API",        callback_data=f"acc:scan_api:{login}")])
-        if show_refresh:
-            rows.append([InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
+        rows.append([InlineKeyboardButton(f"🔑 TOTP {'✅' if has_totp else '❌'}", callback_data=f"acc:set_totp:{login}"),
+                     InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
         rows += [
             [InlineKeyboardButton("✏️ Системный промпт",       callback_data=f"acc:edit_aprompt:{login}"),
              InlineKeyboardButton("💡 Промпт тем",             callback_data=f"acc:edit_tprompt:{login}")],
@@ -358,11 +364,34 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("◀️ К аккаунту",                callback_data=f"acc:manage:{login}")],
             ]))
 
+    elif action == 'set_totp':
+        login = parts[2]
+        creds = storage.get_account_credentials(login)
+        has_totp = bool(creds and creds.get('totp_seed'))
+        has_pwd  = bool(creds and creds.get('password'))
+        cur_seed = (creds.get('totp_seed', '')[:8] + '...') if has_totp else 'не задан'
+        await q.edit_message_text(
+            f"🔑 *TOTP для @{login}*\n\n"
+            f"Пароль: {'✅ сохранён' if has_pwd else '❌ нет'}\n"
+            f"TOTP seed: {'✅ ' + cur_seed if has_totp else '❌ не задан'}\n\n"
+            f"Для авто-перелогина при 403 нужны пароль и TOTP seed.\n\n"
+            f"Отправь сообщением в формате:\n"
+            f"`пароль TOTP_SEED`\n\n"
+            f"Пример:\n"
+            f"`mypass123 P2HQ NQJZ QWCI 7TS3`\n\n"
+            f"Или только TOTP seed (если пароль уже сохранён):\n"
+            f"`- P2HQ NQJZ QWCI 7TS3`\n\n"
+            f"/cancel — отмена",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_conv_state'] = 'set_totp'
+        ctx.user_data['totp_login'] = login
+
     elif action == 'test_warmup':
         login = parts[2]
         await q.edit_message_text(
-            f"🧪 *Тест прогрева @{login}*\n\n⏳ Запускаю проверку...\n"
-            f"search → threads → like → replies → stats",
+            f"🧪 *Тест прогрева @{login}*\n\n⏳ Запускаю...\n"
+            f"При 403 — авто-перелогин (до 60с)",
             parse_mode='Markdown'
         )
         asyncio.ensure_future(_run_warmup_test(q, login))
@@ -379,112 +408,146 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _run_warmup_test(q, login: str):
     """Прогоняет все методы прогрева по одному и шлёт отчёт."""
-    import time as _time
 
     results = {}
     details = []
-    test_kw = 'vpn'
 
     acc = storage.get_account(login)
+    keywords = ['instagram', 'fashion', 'tech', 'music', 'fitness']
     if acc:
         raw_kw = acc.get('warmup_keywords', '')
         if raw_kw:
-            first_kw = [k.strip() for k in raw_kw.split(',') if k.strip()]
-            if first_kw:
-                test_kw = first_kw[0]
+            custom = [k.strip() for k in raw_kw.split(',') if k.strip()]
+            if custom:
+                keywords = custom + keywords
 
-    # 1. search_users
+    # Auth info
+    try:
+        entry = threads_api.get_client(login)
+        client = entry['client']
+        uid = client.user_id if client else '?'
+        auth_mode = 'Bearer' if (client and 'Authorization' in client.session.headers) else 'Cookie'
+        details.append(f"uid={uid}, auth={auth_mode}")
+    except Exception:
+        pass
+
+    # 1. find_warmup_targets (search → recommended → seed)
     users = []
     try:
         users = await asyncio.wait_for(
-            asyncio.to_thread(threads_api.search_users, test_kw, login), timeout=12)
+            asyncio.to_thread(threads_api.find_warmup_targets, keywords, login), timeout=90)
         if users:
-            results['🔍 search'] = f'✅ {len(users)} юзеров'
+            source = 'seed' if any(u.get('username') in ('zuck','mosseri','instagram') for u in users[:3]) else 'API'
+            results['🔍 targets'] = f'✅ {len(users)} ({source})'
             names = ', '.join(f"@{u.get('username','?')}" for u in users[:3])
-            details.append(f"Поиск «{test_kw}»: {names}")
+            details.append(names)
         else:
-            results['🔍 search'] = '⚠️ пусто'
+            results['🔍 targets'] = '❌ 0 юзеров'
     except asyncio.TimeoutError:
-        results['🔍 search'] = '⏱ таймаут'
+        results['🔍 targets'] = '⏱ таймаут'
     except Exception as e:
-        results['🔍 search'] = f'❌ {str(e)[:60]}'
+        results['🔍 targets'] = f'❌ {str(e)[:50]}'
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
-    # 2. get_user_threads
-    test_user_id = None
-    test_post_id = None
-    posts = []
-
+    # 2. follow (тестируем независимо от постов)
     if users:
-        target = users[0]
-        test_user_id = str(target.get('pk') or target.get('id', ''))
-        target_name  = target.get('username', '?')
+        # Берём юзера НЕ из seed (если есть) — чтобы не подписаться на zuck
+        target_follow = None
+        for u in users:
+            if u.get('username') not in ('zuck', 'mosseri', 'instagram', 'threadsapp'):
+                target_follow = u; break
+        if not target_follow:
+            target_follow = users[0]
+        fuid = str(target_follow.get('pk') or target_follow.get('id', ''))
+        fname = target_follow.get('username', '?')
         try:
-            posts = await asyncio.wait_for(
-                asyncio.to_thread(threads_api.get_user_threads, test_user_id, login), timeout=12)
-            if posts:
-                results['📋 threads'] = f'✅ {len(posts)} постов'
-                test_post_id = str(posts[0].get('pk') or posts[0].get('id', ''))
-                details.append(f"@{target_name}: {len(posts)} постов")
-            else:
-                results['📋 threads'] = '⚠️ пусто'
+            ok = await asyncio.wait_for(
+                asyncio.to_thread(threads_api.follow_user, fuid, login), timeout=12)
+            results['👤 follow'] = f'✅ @{fname}' if ok else f'⚠️ False @{fname}'
         except asyncio.TimeoutError:
-            results['📋 threads'] = '⏱ таймаут'
+            results['👤 follow'] = '⏱ таймаут'
         except Exception as e:
-            results['📋 threads'] = f'❌ {str(e)[:60]}'
+            results['👤 follow'] = f'❌ {str(e)[:50]}'
     else:
-        results['📋 threads'] = '⏭ пропуск'
+        results['👤 follow'] = '⏭ нет юзеров'
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
-    # 3. like
+    # 3. get posts — archive (fastest) → user_threads → timeline
+    test_post_id = None
+
+    # Сначала архив — гарантированные свои посты
+    try:
+        archive = storage.get_archive(10)
+        for item in archive:
+            pids = item.get('post_ids', [])
+            if pids:
+                test_post_id = str(pids[0])
+                results['📋 посты'] = f'✅ архив ({len(pids)} id)'
+                break
+    except Exception:
+        pass
+
+    # Если архив пуст — пробуем user_threads
+    if not test_post_id and users:
+        for u in users[:2]:
+            tuid = str(u.get('pk') or u.get('id', ''))
+            tname = u.get('username', '?')
+            try:
+                posts = await asyncio.wait_for(
+                    asyncio.to_thread(threads_api.get_user_threads, tuid, login), timeout=10)
+                if posts:
+                    test_post_id = str(posts[0].get('pk') or posts[0].get('id', ''))
+                    results['📋 посты'] = f'✅ {len(posts)} @{tname}'
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    if '📋 посты' not in results:
+        results['📋 посты'] = '❌ нет постов (публикуй серию)'
+
+    await asyncio.sleep(2)
+
+    # 4. like
     if test_post_id:
         try:
             ok = await asyncio.wait_for(
                 asyncio.to_thread(threads_api.like_thread, test_post_id, login), timeout=12)
             results['❤️ like'] = '✅' if ok else '⚠️ False'
-            if ok:
-                details.append(f"Лайк: pk={test_post_id}")
         except asyncio.TimeoutError:
             results['❤️ like'] = '⏱ таймаут'
         except Exception as e:
-            results['❤️ like'] = f'❌ {str(e)[:60]}'
+            results['❤️ like'] = f'❌ {str(e)[:50]}'
     else:
-        results['❤️ like'] = '⏭ нет поста'
+        results['❤️ like'] = '⏭ нет post\\_id'
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
-    # 4. get_thread_replies
+    # 5. get_thread_replies + stats
     if test_post_id:
         try:
             replies = await asyncio.wait_for(
                 asyncio.to_thread(threads_api.get_thread_replies, test_post_id, login), timeout=12)
-            results['💬 replies'] = f'✅ {len(replies)} ответов'
+            results['💬 replies'] = f'✅ {len(replies)}'
         except asyncio.TimeoutError:
-            results['💬 replies'] = '⏱ таймаут'
+            results['💬 replies'] = '⏱'
         except Exception as e:
-            results['💬 replies'] = f'❌ {str(e)[:60]}'
-    else:
-        results['💬 replies'] = '⏭ нет поста'
+            results['💬 replies'] = f'❌ {str(e)[:40]}'
 
-    await asyncio.sleep(2)
-
-    # 5. get_thread_stats
-    if test_post_id:
         try:
             stats = await asyncio.wait_for(
                 asyncio.to_thread(threads_api.get_thread_stats, test_post_id, login), timeout=12)
             if stats:
-                results['📊 stats'] = f"✅ ❤️{stats.get('likes',0)} 💬{stats.get('replies',0)} 🔁{stats.get('reposts',0)}"
+                results['📊 stats'] = f"✅ ❤️{stats.get('likes',0)} 💬{stats.get('replies',0)}"
             else:
                 results['📊 stats'] = '⚠️ пусто'
-        except asyncio.TimeoutError:
-            results['📊 stats'] = '⏱ таймаут'
         except Exception as e:
-            results['📊 stats'] = f'❌ {str(e)[:60]}'
+            results['📊 stats'] = f'❌ {str(e)[:40]}'
     else:
-        results['📊 stats'] = '⏭ нет поста'
+        results['💬 replies'] = '⏭'
+        results['📊 stats'] = '⏭'
 
     # Собираем отчёт
     ok_count  = sum(1 for v in results.values() if '✅' in v)
@@ -552,22 +615,26 @@ async def _run_api_scan(q, login: str):
 
     # ── Эндпоинты для теста ──
     ENDPOINTS = [
-        # (base_url, method, path, описание)
-        # --- threads.net GET ---
-        ('threads.net',     'GET',  '/users/search/?q=vpn&count=5',             'Поиск юзеров'),
-        ('threads.net',     'GET',  f'/text_feed/recommended_users/?search_query=vpn', 'Рекомендации'),
-        ('threads.net',     'GET',  '/users/web_profile_info/?username=threads', 'Профиль по username'),
-        ('threads.net',     'GET',  f'/text_feed/{uid}/profile/',               'Мои посты'),
-        ('threads.net',     'GET',  '/text_feed/timeline/',                     'Лента'),
-        ('threads.net',     'GET',  '/accounts/current_user/?edit=true',        'Текущий юзер'),
-        ('threads.net',     'GET',  '/text_feed/text_app_notifications/',       'Уведомления'),
-        ('threads.net',     'GET',  '/text_feed/text_app_settings/',            'Настройки'),
-        ('threads.net',     'GET',  '/qp/batch_fetch/',                         'QP batch'),
-        # --- i.instagram.com GET ---
-        ('i.instagram.com', 'GET',  '/users/search/?q=vpn&count=5',            'Поиск (IG)'),
-        ('i.instagram.com', 'GET',  f'/text_feed/{uid}/profile/',              'Мои посты (IG)'),
-        ('i.instagram.com', 'GET',  '/accounts/current_user/?edit=true',       'Текущий юзер (IG)'),
-        ('i.instagram.com', 'GET',  '/text_feed/timeline/',                    'Лента (IG)'),
+        # --- ПОИСК: разные вариации параметров ---
+        ('threads.net', 'GET', '/users/search/?q=fashion&count=30', 'search q=fashion'),
+        ('threads.net', 'GET', '/users/search/?q=zuck&count=10', 'search q=zuck'),
+        ('threads.net', 'GET', '/users/search/?q=instagram&count=10&search_surface=user_search_page', 'search +surface'),
+        ('threads.net', 'GET', '/users/search/?q=nike&count=10&search_surface=follow_list_page', 'search +follow_surface'),
+        ('threads.net', 'GET', '/text_feed/recommended_users/', 'recommended (без query)'),
+        ('threads.net', 'GET', '/text_feed/recommended_users/?search_query=fashion', 'recommended q=fashion'),
+        ('threads.net', 'GET', '/text_feed/text_app_search/recent/', 'search/recent'),
+        ('threads.net', 'GET', '/text_feed/text_app_explore/', 'explore feed'),
+        ('threads.net', 'GET', '/users/search/?q=threads&count=10&is_typeahead=true', 'typeahead search'),
+        # --- ПРОФИЛЬ / ПОСТЫ ---
+        ('threads.net', 'GET', f'/text_feed/{uid}/profile/', 'Мои посты'),
+        ('threads.net', 'GET', '/accounts/current_user/?edit=true', 'current_user'),
+        ('threads.net', 'GET', '/text_feed/timeline/', 'timeline'),
+        ('threads.net', 'GET', '/text_feed/text_app_notifications/', 'notifications'),
+        # --- i.instagram.com зеркало ---
+        ('i.instagram.com', 'GET', '/users/search/?q=fashion&count=30', 'search (IG)'),
+        ('i.instagram.com', 'GET', '/users/search/?q=zuck&count=10&search_surface=user_search_page', 'search+surface (IG)'),
+        ('i.instagram.com', 'GET', f'/text_feed/{uid}/profile/', 'посты (IG)'),
+        ('i.instagram.com', 'GET', '/accounts/current_user/?edit=true', 'current_user (IG)'),
     ]
 
     # Добавляем POST-тесты если есть post_id
@@ -602,7 +669,7 @@ async def _run_api_scan(q, login: str):
                 results.append({
                     'base': base, 'method': method, 'path': path_only,
                     'desc': desc, 'status': r.status_code,
-                    'body': r.text[:200], 'ms': ms,
+                    'body': r.text[:500], 'ms': ms,
                 })
             except Exception as e:
                 ms = int((_t.time() - t0) * 1000)
@@ -645,15 +712,103 @@ async def _run_api_scan(q, login: str):
         else:
             emoji = '❌'
 
-        # Короткий body для 200
+        # Для 200 — показываем полезную инфо
         snippet = ''
         if s == 200:
-            b = r['body'][:60].replace('\n', ' ').replace('`', "'").replace('*', '').replace('_', '')
-            snippet = f' `{b}`'
+            try:
+                body_json = _json.loads(r['body'])
+                # Считаем юзеров если есть
+                user_count = len(body_json.get('users', []))
+                has_more   = body_json.get('has_more', '')
+                status_val = body_json.get('status', '')
+                if 'users' in body_json:
+                    snippet = f' users:{user_count}'
+                    if has_more:
+                        snippet += ' has\\_more'
+                    if user_count > 0:
+                        first = body_json['users'][0].get('username', '?')
+                        snippet += f' @{first}'
+                elif 'threads' in body_json:
+                    snippet += f' threads:{len(body_json["threads"])}'
+                else:
+                    b = r['body'][:50].replace('\n', ' ').replace('`', "'").replace('*', '').replace('_', '')
+                    snippet = f' `{b}`'
+            except Exception:
+                b = r['body'][:50].replace('\n', ' ').replace('`', "'").replace('*', '').replace('_', '')
+                snippet = f' `{b}`'
 
-        lines.append(f"{emoji}`{s:>3}` {r['ms']:>4}ms {r['base'][:6]} {r['desc']}{snippet}")
+        lines.append(f"{emoji}`{s:>3}` {r['ms']:>4}ms {r['desc']}{snippet}")
 
     lines.append(f"\n*Итого:* {ok_count}✅ / {len(results)} эндпоинтов")
+
+    # ── Live Test: ищем реального юзера и тестируем с его данными ──
+    def _live_test():
+        live = []
+        # Ищем юзеров
+        for kw in ['instagram', 'fashion', 'threads', 'music', 'fitness']:
+            try:
+                r = session.get(f'https://www.threads.net/api/v1/users/search/',
+                                params={'q': kw, 'count': 10}, timeout=10, allow_redirects=False)
+                if r.status_code == 200:
+                    data = r.json()
+                    found = data.get('users', [])
+                    if found:
+                        live.append(('search', f'✅ «{kw}»: {len(found)} юзеров'))
+                        # Берём первого юзера
+                        target = found[0]
+                        real_uid = str(target.get('pk') or target.get('id', ''))
+                        real_name = target.get('username', '?')
+                        live.append(('found', f'@{real_name} uid={real_uid}'))
+
+                        # Тестируем text_feed с РЕАЛЬНЫМ uid
+                        import time as _t; _t.sleep(2)
+                        r2 = session.get(f'https://www.threads.net/api/v1/text_feed/{real_uid}/profile/',
+                                         timeout=10, allow_redirects=False)
+                        live.append(('text_feed', f'HTTP {r2.status_code} ({len(r2.text)} bytes)'))
+
+                        if r2.status_code == 200:
+                            posts = []
+                            try:
+                                resp = r2.json()
+                                for t in (resp.get('threads', []) or []):
+                                    if isinstance(t, dict):
+                                        for item in (t.get('thread_items', []) or []):
+                                            post = item.get('post', item) if isinstance(item, dict) else item
+                                            if post: posts.append(post)
+                            except Exception:
+                                pass
+
+                            if posts:
+                                real_pid = str(posts[0].get('pk') or posts[0].get('id', ''))
+                                live.append(('posts', f'{len(posts)} постов, first pk={real_pid}'))
+
+                                # Тестируем like
+                                _t.sleep(2)
+                                like_data = {'signed_body': f'SIGNATURE.{_json.dumps({"media_id": real_pid, "_uid": uid, "_uuid": duuid})}'}
+                                r3 = session.post(f'https://www.threads.net/api/v1/media/{real_pid}/like/',
+                                                  data=like_data, timeout=10, allow_redirects=False)
+                                live.append(('like', f'HTTP {r3.status_code}'))
+                            else:
+                                live.append(('posts', '0 постов'))
+                        break
+            except Exception as e:
+                live.append(('search', f'❌ {kw}: {str(e)[:40]}'))
+                break
+        if not live:
+            live.append(('search', '⚠️ 0 юзеров по всем словам'))
+        return live
+
+    try:
+        live_results = await asyncio.wait_for(asyncio.to_thread(_live_test), timeout=45)
+    except asyncio.TimeoutError:
+        live_results = [('timeout', '⏱ >45s')]
+    except Exception as e:
+        live_results = [('error', f'❌ {str(e)[:60]}')]
+
+    lines.append('\n*Live тест (реальные данные):*')
+    for name, val in live_results:
+        val_safe = val.replace('`', "'").replace('*', '').replace('_', '')
+        lines.append(f"  {name}: {val_safe}")
 
     text = '\n'.join(lines)
     if len(text) > 4000:
@@ -1284,6 +1439,7 @@ async def conv_cancel(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop('_waiting_photo_for', None)
     ctx.user_data.pop('img_login', None)
     ctx.user_data.pop('refresh_token_login', None)
+    ctx.user_data.pop('totp_login', None)
     await upd.message.reply_text("Отменено.", reply_markup=kb_main())
     return ConversationHandler.END
 
@@ -1297,7 +1453,9 @@ async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if not state:
         return
 
-    login = ctx.user_data.get('edit_prompt_login')
+    login = (ctx.user_data.get('edit_prompt_login')
+             or ctx.user_data.get('totp_login')
+             or ctx.user_data.get('refresh_token_login'))
     text  = upd.message.text.strip()
 
     if state == 'edit_account_prompt':
@@ -1376,6 +1534,85 @@ async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE)
                 [InlineKeyboardButton("📋 Посмотреть промпты", callback_data=f"acc:show_prompts:{login}")],
                 [InlineKeyboardButton("👤 К аккаунту",         callback_data=f"acc:manage:{login}")],
             ]))
+
+    elif state == 'set_totp':
+        login = ctx.user_data.pop('totp_login', login)
+        ctx.user_data.pop('_conv_state', None)
+
+        # Парсим: "пароль TOTP_SEED" или "- TOTP_SEED"
+        parts_msg = text.split(None, 1)
+        password_part = ''
+        totp_part     = ''
+
+        if len(parts_msg) == 1:
+            # Только одно значение — считаем что это TOTP seed
+            totp_part = parts_msg[0]
+        else:
+            if parts_msg[0] == '-':
+                # Пароль не менять, только TOTP
+                totp_part = parts_msg[1]
+            else:
+                password_part = parts_msg[0]
+                totp_part     = parts_msg[1]
+
+        # Валидируем TOTP seed
+        totp_clean = totp_part.replace(' ', '').upper()
+        totp_ok = False
+        if totp_clean:
+            try:
+                import pyotp
+                code = pyotp.TOTP(totp_clean).now()
+                totp_ok = True
+            except Exception as e:
+                await upd.message.reply_text(
+                    f"❌ Невалидный TOTP seed: {e}\n\n"
+                    f"Проверь формат — должен быть base32 (буквы A-Z, цифры 2-7).",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"acc:set_totp:{login}"),
+                        InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}"),
+                    ]]))
+                return
+
+        storage.set_account_credentials(login,
+                                         password=password_part or '',
+                                         totp_seed=totp_clean if totp_ok else '')
+
+        # Показываем что сохранилось
+        creds = storage.get_account_credentials(login)
+        has_pwd  = bool(creds and creds.get('password'))
+        has_totp = bool(creds and creds.get('totp_seed'))
+
+        lines = [f"✅ *Credentials для @{login}*\n"]
+        if password_part:
+            lines.append("🔑 Пароль: ✅ сохранён")
+        elif has_pwd:
+            lines.append("🔑 Пароль: ✅ (уже был)")
+        else:
+            lines.append("🔑 Пароль: ❌ не задан")
+
+        if totp_ok:
+            try:
+                import pyotp
+                test_code = pyotp.TOTP(totp_clean).now()
+                lines.append(f"🔐 TOTP: ✅ сохранён (тест: `{test_code}`)")
+            except Exception:
+                lines.append("🔐 TOTP: ✅ сохранён")
+        elif has_totp:
+            lines.append("🔐 TOTP: ✅ (уже был)")
+
+        if has_pwd and has_totp:
+            lines.append("\n🤖 *Авто-перелогин активен!*\nПри 403 бот автоматически перелогинится.")
+        else:
+            missing = []
+            if not has_pwd:  missing.append('пароль')
+            if not has_totp: missing.append('TOTP seed')
+            lines.append(f"\n⚠️ Для авто-перелогина нужно: {', '.join(missing)}")
+
+        await upd.message.reply_text('\n'.join(lines), parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🧪 Тест прогрева", callback_data=f"acc:test_warmup:{login}"),
+                InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}"),
+            ]]))
 
 
 async def universal_photo_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):

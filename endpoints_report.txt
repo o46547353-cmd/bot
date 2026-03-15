@@ -1,0 +1,87 @@
+ENDPOINTS SCAN REPORT
+Account: zoelewis2180b  |  user_id: 46896235459
+Total: 24  |  OK: 2
+
+[200] 1176ms  threads.net  GET /text_feed/recommended_users/?search_query=vpn
+       {"users":[],"paging_token":"","has_more":false,"unreciprocated_follows_only":false,"status":"ok"}
+
+[200] 1961ms  threads.net  GET /users/search/?q=vpn&count=5
+       {"num_results":0,"users":[],"has_more":true,"rank_token":"1773602542191|36ae24824d40f2b1ffa1ab80aed53e0f2534dd7d614fe0dde55cb297936e9aad","clear_clien
+
+[403]  215ms  threads.net  GET /accounts/current_user/?edit=true
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  224ms  i.instagram.com  GET /accounts/current_user/?edit=true
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  235ms  threads.net  POST /friendships/create/{uid}/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  240ms  threads.net  POST /friendships/destroy/{uid}/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  214ms  threads.net  POST /friendships/show/{uid}/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[401]  200ms  threads.net  GET /friendships/{uid}/followers/
+       {"message":"Please wait a few minutes before you try again.","require_login":true,"igweb_rollout":tr
+
+[401]  200ms  threads.net  GET /friendships/{uid}/following/
+       {"message":"Please wait a few minutes before you try again.","require_login":true,"igweb_rollout":tr
+
+[403]  238ms  threads.net  POST /media/configure_text_post_app_feed/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[404]  225ms  threads.net  POST /media/{pid}/like/
+       <!DOCTYPE html>
+<html lang="None" class="no-js not-logged-in ">
+    <head>
+        <meta charset="ut
+
+[404]  190ms  threads.net  POST /media/{pid}/unlike/
+       <!DOCTYPE html>
+<html lang="None" class="no-js not-logged-in ">
+    <head>
+        <meta charset="ut
+
+[403]  276ms  threads.net  GET /qp/batch_fetch/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  250ms  threads.net  POST /repost/create_repost/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  232ms  threads.net  POST /repost/delete_text_app_repost/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  251ms  threads.net  GET /text_feed/link_preview/?url=https://example.com
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  250ms  threads.net  GET /text_feed/text_app_notifications/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[404]  188ms  threads.net  GET /text_feed/text_app_settings/
+       <!DOCTYPE html>
+<html lang="None" class="no-js not-logged-in ">
+    <head>
+        <meta charset="ut
+
+[404]  227ms  threads.net  GET /text_feed/timeline/
+       <!DOCTYPE html>
+<html lang="None" class="no-js not-logged-in ">
+    <head>
+        <meta charset="ut
+
+[403]  526ms  threads.net  GET /text_feed/{uid}/profile/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  222ms  i.instagram.com  GET /text_feed/{uid}/profile/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  325ms  threads.net  GET /text_feed/{uid}/replies/
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[403]  964ms  i.instagram.com  GET /users/search/?q=vpn&count=5
+       {"message":"login_required","error_title":"You've Been Logged Out","error_body":"Please log back in.
+
+[429]  165ms  threads.net  GET /users/web_profile_info/?username=threads
+
