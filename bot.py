@@ -28,9 +28,13 @@ _scheduler_started = False   # BUG-16 FIX
 
 # ─── Состояния ───────────────────────────────────────────────────────────────
 WAIT_2FA = 1
-WAIT_MANUAL_LOGIN, WAIT_MANUAL_SESSION, WAIT_MANUAL_CSRF   = 10, 11, 12
-WAIT_IMAGE_LOGIN, WAIT_PHOTO                               = 20, 21
+WAIT_MANUAL_LOGIN, WAIT_MANUAL_SESSION, WAIT_MANUAL_CSRF          = 10, 11, 12
+WAIT_IMAGE_LOGIN, WAIT_PHOTO                                       = 20, 21
 WAIT_SETUP_LOGIN, WAIT_SETUP_KEYWORDS, WAIT_SETUP_PRESET, WAIT_SETUP_PROMPTS = 30, 31, 32, 33
+# Новые состояния: редактирование промптов и картинки прямо из меню аккаунта
+WAIT_EDIT_ACCOUNT_PROMPT = 50
+WAIT_EDIT_TOPIC_PROMPT   = 51
+WAIT_PHOTO_DIRECT        = 52
 
 
 def is_admin(upd):
@@ -50,10 +54,60 @@ def kb_main():
     ])
 
 
+HELP_TEXT = (
+    "🔒 *SLASH VPN Bot — все команды*\n\n"
+    "━━━━━━━━━ 👤 *Аккаунты* ━━━━━━━━━\n"
+    "/add\\_account `login password`\n"
+    "  Добавить аккаунт через логин и пароль\n\n"
+    "/manual\\_cookies\n"
+    "  Добавить через cookies из браузера\n"
+    "  _(F12 → Application → Cookies → threads.net → sessionid и csrftoken)_\n\n"
+    "━━━━━━━━━ 🖼 *Картинка* ━━━━━━━━━\n"
+    "/kartinka\n"
+    "  Загрузить картинку для аккаунта\n"
+    "  Бот спросит логин аккаунта, потом отправь фото как *фото* (не файл)\n"
+    "  Картинка прикрепляется к 3-му посту серии\n\n"
+    "━━━━━━━━━ ⚙️ *Настройка аккаунта* ━━━━━━━━━\n"
+    "/setup\n"
+    "  Интерактивная настройка: ключевые слова, пресет прогрева\n\n"
+    "/prompt\\_account\n"
+    "  Изменить системный промпт *(как AI пишет посты)*\n"
+    "  Инструкция для AI — стиль, продукт, CTA, тарифы\n\n"
+    "/prompt\\_topic\n"
+    "  Изменить промпт для генерации тем постов\n\n"
+    "/show\\_prompts\n"
+    "  Показать текущие промпты аккаунта\n\n"
+    "━━━━━━━━━ 📝 *Посты* ━━━━━━━━━\n"
+    "/seriya `login тема`\n"
+    "  Сгенерировать серию по теме\n"
+    "  Пример: `/seriya mylogin Блокировки YouTube 2025`\n\n"
+    "/interval `часы` — интервал автопостинга\n\n"
+    "━━━━━━━━━ 🎛 *Управление* ━━━━━━━━━\n"
+    "/start  — главное меню\n"
+    "/help   — эта справка\n"
+    "/cancel — отменить текущий диалог\n\n"
+    "━━━━━━━━━ 💡 *Подсказки* ━━━━━━━━━\n"
+    "• Прогрев и автопостинг включаются в меню *Автопилот*\n"
+    "• Картинка прикрепляется к посту 3 (с тарифами и CTA)\n"
+    "• 🔑✅ Danie1 token есть — image-постинг работает\n"
+    "• 🔑❌ Нет token — добавь: `/add\\_account логин ПАРОЛЬ`"
+)
+
+
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await upd.message.reply_text(
-        "🔒 *SLASH VPN Bot*\n\nВыбери раздел:",
+        "🔒 *SLASH VPN Bot*\n\nВыбери раздел или /help для справки:",
         parse_mode='Markdown', reply_markup=kb_main()
+    )
+
+
+async def cmd_help(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await upd.message.reply_text(
+        HELP_TEXT,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")
+        ]])
     )
 
 
@@ -122,16 +176,19 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         acc   = storage.get_account(login)
         if not acc:
             await q.edit_message_text("Аккаунт не найден."); return
-        wp  = "🟢 Вкл" if acc.get('warmup_active')  else "⚫ Выкл"
-        ap  = "🟢 Вкл" if acc.get('autopost_active') else "⚫ Выкл"
-        img = "✅" if storage.get_image(login) else "❌"
-        tok = "✅" if storage.get_setting(f'threads_api_token:{login}') else "❌"
+        wp    = "🟢 Вкл" if acc.get('warmup_active')  else "⚫ Выкл"
+        ap    = "🟢 Вкл" if acc.get('autopost_active') else "⚫ Выкл"
+        img   = "🖼✅" if storage.get_image(login) else "🖼❌"
+        tok   = "🔑✅" if storage.get_setting(f'threads_api_token:{login}') else "🔑❌"
+        has_ap = bool((acc.get('account_prompt') or '').strip())
+        has_tp = bool((acc.get('topic_prompt') or '').strip())
         text = (
             f"*@{acc.get('username', login)}*\n\n"
-            f"Прогрев: {wp}\nАвтопостинг: {ap}\n"
-            f"Картинка: {img} | Danie1 token: {tok}\n"
-            f"В очереди: {storage.count(login)}\n"
-            f"Пресет: {acc.get('warmup_preset', 'A')}\n"
+            f"Прогрев: {wp}  |  Автопостинг: {ap}\n"
+            f"{img} Картинка  {tok} Danie1 token\n"
+            f"📝 Системный промпт: {'✅' if has_ap else '⚫ дефолтный'}\n"
+            f"💡 Промпт тем: {'✅' if has_tp else '⚫ дефолтный'}\n\n"
+            f"В очереди: {storage.count(login)}  |  Пресет: {acc.get('warmup_preset', 'A')}\n"
             f"Ключевые слова: `{acc.get('warmup_keywords', '—')}`"
         )
         toggle_w = "⏹ Стоп прогрев"  if acc.get('warmup_active')  else "▶️ Старт прогрев"
@@ -142,7 +199,11 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🎲 Авто-серия",  callback_data=f"acc:autoseriya:{login}"),
              InlineKeyboardButton("📋 Очередь",     callback_data=f"acc:queue:{login}")],
             [InlineKeyboardButton("▶️ Пост сейчас", callback_data=f"acc:postnow:{login}")],
-            [InlineKeyboardButton("◀️ Назад",       callback_data="menu:accounts")],
+            [InlineKeyboardButton("🖼 Загрузить картинку",     callback_data=f"acc:upload_img:{login}")],
+            [InlineKeyboardButton("✏️ Системный промпт",       callback_data=f"acc:edit_aprompt:{login}"),
+             InlineKeyboardButton("💡 Промпт тем",             callback_data=f"acc:edit_tprompt:{login}")],
+            [InlineKeyboardButton("📋 Показать промпты",       callback_data=f"acc:show_prompts:{login}")],
+            [InlineKeyboardButton("◀️ Назад",                  callback_data="menu:accounts")],
         ]))
 
     elif action == 'toggle_w':
@@ -203,6 +264,71 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("▶️ Опубликовать первую", callback_data=f"acc:postnow:{login}"),
                 InlineKeyboardButton("◀️ Назад", callback_data=f"acc:manage:{login}"),
             ]]))
+
+    elif action == 'upload_img':
+        # Просим отправить фото прямо в этот чат — сохраняем login и ждём фото
+        login = parts[2]
+        ctx.user_data['img_login'] = login
+        await q.edit_message_text(
+            f"📸 *Загрузка картинки для @{login}*\n\n"
+            f"Отправь фото прямо сюда как *фото* (не файл/документ).\n\n"
+            f"❗ Именно через скрепку → *Фото*, иначе Telegram сожмёт качество неправильно.\n\n"
+            f"/cancel — отмена",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_waiting_photo_for'] = login
+
+    elif action == 'edit_aprompt':
+        login = parts[2]
+        acc   = storage.get_account(login)
+        cur   = (acc.get('account_prompt') or '').strip() if acc else ''
+        ctx.user_data['edit_prompt_login'] = login
+        preview = (cur[:400] + '...') if len(cur) > 400 else cur
+        await q.edit_message_text(
+            f"✏️ *Системный промпт для @{login}*\n\n"
+            f"Это инструкция для AI — как писать посты, стиль, CTA, тарифы.\n\n"
+            f"{'*Текущий:*\n`' + preview + '`' if cur else '*Сейчас:* используется дефолтный SLASH VPN'}\n\n"
+            f"Напиши новый промпт и отправь сообщением.\n"
+            f"Или отправь `-` чтобы сбросить на дефолтный.\n\n"
+            f"/cancel — отмена",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_conv_state'] = 'edit_account_prompt'
+
+    elif action == 'edit_tprompt':
+        login = parts[2]
+        acc   = storage.get_account(login)
+        cur   = (acc.get('topic_prompt') or '').strip() if acc else ''
+        ctx.user_data['edit_prompt_login'] = login
+        await q.edit_message_text(
+            f"💡 *Промпт тем для @{login}*\n\n"
+            f"Это инструкция для AI — о чём придумывать темы постов.\n\n"
+            f"{'*Текущий:*\n`' + cur + '`' if cur else '*Сейчас:* дефолтный (VPN, блокировки, слежка, скорость)'}\n\n"
+            f"Напиши новый промпт и отправь сообщением.\n"
+            f"Или отправь `-` чтобы сбросить на дефолтный.\n\n"
+            f"/cancel — отмена",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_conv_state'] = 'edit_topic_prompt'
+
+    elif action == 'show_prompts':
+        login = parts[2]
+        acc   = storage.get_account(login)
+        if not acc:
+            await q.edit_message_text("Аккаунт не найден."); return
+        ap = (acc.get('account_prompt') or '').strip()
+        tp = (acc.get('topic_prompt') or '').strip()
+        text = f"📋 *Промпты @{acc.get('username', login)}*\n\n"
+        text += "*📝 Системный промпт (как писать посты):*\n"
+        text += f"`{ap[:600]}`{'...' if len(ap) > 600 else ''}\n" if ap else "_используется дефолтный SLASH VPN_\n"
+        text += "\n*💡 Промпт тем (о чём писать):*\n"
+        text += f"`{tp[:300]}`{'...' if len(tp) > 300 else ''}" if tp else "_используется дефолтный (VPN, блокировки, слежка)_"
+        await q.edit_message_text(text, parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить системный промпт", callback_data=f"acc:edit_aprompt:{login}")],
+                [InlineKeyboardButton("💡 Изменить промпт тем",       callback_data=f"acc:edit_tprompt:{login}")],
+                [InlineKeyboardButton("◀️ К аккаунту",                callback_data=f"acc:manage:{login}")],
+            ]))
 
 
 # ─── Автопилот ───────────────────────────────────────────────────────────────
@@ -492,7 +618,20 @@ async def cmd_kartinka(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accs = threads_api.list_accounts()
     if not accs:
         await upd.message.reply_text("Нет аккаунтов."); return ConversationHandler.END
-    await upd.message.reply_text(f"Аккаунты: {', '.join(accs)}\n\nВведи логин:")
+    if len(accs) == 1:
+        # Только один аккаунт — пропускаем вопрос про логин
+        ctx.user_data['img_login'] = accs[0]
+        await upd.message.reply_text(
+            f"📸 Отправь фото для *{accs[0]}* как *фото* (не файл):\n\n"
+            f"❗️ Именно фото, не документ — иначе качество потеряется",
+            parse_mode='Markdown'
+        )
+        return WAIT_PHOTO
+    buttons = [[InlineKeyboardButton(f"@{a}", callback_data=f"img_acc:{a}")] for a in accs]
+    await upd.message.reply_text(
+        "Для какого аккаунта загрузить картинку?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
     return WAIT_IMAGE_LOGIN
 
 async def kartinka_login_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -514,6 +653,171 @@ async def handle_photo(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await upd.message.reply_text(f"✅ Картинка сохранена для *{login}*", parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")]]))
     return ConversationHandler.END
+
+
+
+# ─── Промпты и картинка из кнопок аккаунта ───────────────────────────────────
+
+async def cmd_prompt_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /prompt_account — изменить системный промпт для генерации постов."""
+    if not is_admin(upd): return ConversationHandler.END
+    accs = threads_api.list_accounts()
+    if not accs:
+        await upd.message.reply_text("Нет аккаунтов."); return ConversationHandler.END
+
+    if len(accs) == 1:
+        ctx.user_data['edit_prompt_login'] = accs[0]
+    elif ctx.args:
+        login = ctx.args[0]
+        if login not in accs:
+            await upd.message.reply_text(f"❌ Аккаунт {login} не найден."); return ConversationHandler.END
+        ctx.user_data['edit_prompt_login'] = login
+    else:
+        buttons = [[InlineKeyboardButton(f"@{a}", callback_data=f"selaccount:prompt_account:{a}")] for a in accs]
+        await upd.message.reply_text("Выбери аккаунт:", reply_markup=InlineKeyboardMarkup(buttons))
+        return ConversationHandler.END
+
+    login = ctx.user_data['edit_prompt_login']
+    acc   = storage.get_account(login)
+    cur   = (acc.get('account_prompt') or '').strip() if acc else ''
+    await upd.message.reply_text(
+        f"✏️ *Системный промпт для @{login}*\n\n"
+        f"Это инструкция для AI — как писать посты, стиль, продукт, тарифы, CTA.\n\n"
+        f"{'*Текущий:*\n' + cur[:300] + '...' if len(cur) > 300 else ('*Текущий:*\n' + cur) if cur else '*Сейчас:* используется дефолтный промпт SLASH VPN'}\n\n"
+        f"Напиши новый промпт или отправь `-` чтобы сбросить на дефолтный:",
+        parse_mode='Markdown'
+    )
+    return WAIT_EDIT_ACCOUNT_PROMPT
+
+
+async def edit_account_prompt_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = ctx.user_data.get('edit_prompt_login')
+    text  = upd.message.text.strip()
+    if text == '-':
+        storage.update_account_prompts(login, '', storage.get_account(login).get('topic_prompt', '') if storage.get_account(login) else '')
+        await upd.message.reply_text(f"✅ Промпт *@{login}* сброшен на дефолтный", parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")]]))
+    else:
+        acc = storage.get_account(login)
+        storage.update_account_prompts(login, text, acc.get('topic_prompt', '') if acc else '')
+        await upd.message.reply_text(
+            f"✅ Системный промпт сохранён для *@{login}*\n\nТеперь все посты будут генерироваться по этой инструкции.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")]]))
+    return ConversationHandler.END
+
+
+async def cmd_prompt_topic(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /prompt_topic — изменить промпт для генерации тем постов."""
+    if not is_admin(upd): return ConversationHandler.END
+    accs = threads_api.list_accounts()
+    if not accs:
+        await upd.message.reply_text("Нет аккаунтов."); return ConversationHandler.END
+
+    if len(accs) == 1:
+        ctx.user_data['edit_prompt_login'] = accs[0]
+    elif ctx.args:
+        login = ctx.args[0]
+        if login not in accs:
+            await upd.message.reply_text(f"❌ Аккаунт {login} не найден."); return ConversationHandler.END
+        ctx.user_data['edit_prompt_login'] = login
+    else:
+        buttons = [[InlineKeyboardButton(f"@{a}", callback_data=f"selaccount:prompt_topic:{a}")] for a in accs]
+        await upd.message.reply_text("Выбери аккаунт:", reply_markup=InlineKeyboardMarkup(buttons))
+        return ConversationHandler.END
+
+    login = ctx.user_data['edit_prompt_login']
+    acc   = storage.get_account(login)
+    cur   = (acc.get('topic_prompt') or '').strip() if acc else ''
+    await upd.message.reply_text(
+        f"✏️ *Промпт для тем постов @{login}*\n\n"
+        f"Это инструкция для AI — какие темы придумывать для постов.\n\n"
+        f"{'*Текущий:*\n' + cur if cur else '*Сейчас:* используется дефолтный (темы про VPN, блокировки, слежку)'}\n\n"
+        f"Напиши новый промпт или `-` чтобы сбросить на дефолтный:",
+        parse_mode='Markdown'
+    )
+    return WAIT_EDIT_TOPIC_PROMPT
+
+
+async def edit_topic_prompt_h(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    login = ctx.user_data.get('edit_prompt_login')
+    text  = upd.message.text.strip()
+    acc   = storage.get_account(login)
+    cur_account_prompt = acc.get('account_prompt', '') if acc else ''
+    if text == '-':
+        storage.update_account_prompts(login, cur_account_prompt, '')
+        await upd.message.reply_text(f"✅ Промпт тем *@{login}* сброшен на дефолтный", parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")]]))
+    else:
+        storage.update_account_prompts(login, cur_account_prompt, text)
+        await upd.message.reply_text(
+            f"✅ Промпт тем сохранён для *@{login}*\n\nAI будет придумывать темы по этой инструкции.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")]]))
+    return ConversationHandler.END
+
+
+async def cmd_show_prompts(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /show_prompts — показать текущие промпты аккаунта."""
+    if not is_admin(upd): return
+    accs = threads_api.list_accounts()
+    if not accs:
+        await upd.message.reply_text("Нет аккаунтов."); return
+
+    login = ctx.args[0] if ctx.args else accs[0]
+    if login not in accs:
+        await upd.message.reply_text(f"❌ Аккаунт {login} не найден."); return
+    acc = storage.get_account(login)
+    if not acc:
+        await upd.message.reply_text("Аккаунт не найден."); return
+
+    ap = (acc.get('account_prompt') or '').strip()
+    tp = (acc.get('topic_prompt') or '').strip()
+
+    text = f"📋 *Промпты @{login}*\n\n"
+    text += f"*1. Системный промпт (генерация постов):*\n"
+    if ap:
+        text += f"`{ap[:500]}`{'...' if len(ap) > 500 else ''}\n\n"
+    else:
+        text += "_используется дефолтный SLASH VPN_\n\n"
+    text += f"*2. Промпт тем:*\n"
+    if tp:
+        text += f"`{tp[:300]}`{'...' if len(tp) > 300 else ''}"
+    else:
+        text += "_используется дефолтный (VPN, блокировки, слежка)_"
+
+    await upd.message.reply_text(text, parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить системный промпт", callback_data=f"acc:edit_aprompt:{login}")],
+            [InlineKeyboardButton("✏️ Изменить промпт тем",       callback_data=f"acc:edit_tprompt:{login}")],
+            [InlineKeyboardButton("👤 К аккаунту",                 callback_data=f"acc:manage:{login}")],
+        ]))
+
+
+async def cb_selaccount(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора аккаунта для команд prompt_account и prompt_topic."""
+    q = upd.callback_query; await q.answer()
+    _, cmd, login = q.data.split(':', 2)
+    ctx.user_data['edit_prompt_login'] = login
+    acc = storage.get_account(login)
+    if cmd == 'prompt_account':
+        cur = (acc.get('account_prompt') or '').strip() if acc else ''
+        await q.edit_message_text(
+            f"✏️ *Системный промпт для @{login}*\n\n"
+            f"{'*Текущий:*\n' + cur[:300] + ('...' if len(cur) > 300 else '') if cur else '*Сейчас:* дефолтный SLASH VPN'}\n\n"
+            f"Напиши новый промпт или `-` чтобы сбросить на дефолтный:",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_conv_state'] = 'edit_account_prompt'
+    elif cmd == 'prompt_topic':
+        cur = (acc.get('topic_prompt') or '').strip() if acc else ''
+        await q.edit_message_text(
+            f"✏️ *Промпт тем для @{login}*\n\n"
+            f"{'*Текущий:*\n' + cur if cur else '*Сейчас:* дефолтный (VPN, блокировки)'}\n\n"
+            f"Напиши новый промпт или `-` чтобы сбросить:",
+            parse_mode='Markdown'
+        )
+        ctx.user_data['_conv_state'] = 'edit_topic_prompt'
 
 
 async def cmd_seriya(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -572,8 +876,82 @@ async def cb_interval(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def conv_cancel(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем все pending-состояния
+    ctx.user_data.pop('_conv_state', None)
+    ctx.user_data.pop('edit_prompt_login', None)
+    ctx.user_data.pop('_waiting_photo_for', None)
+    ctx.user_data.pop('img_login', None)
     await upd.message.reply_text("Отменено.", reply_markup=kb_main())
     return ConversationHandler.END
+
+
+async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Универсальный обработчик текстовых сообщений для inline-редактирования промптов.
+    Срабатывает когда пользователь нажал кнопку ✏️ из меню аккаунта и вводит промпт.
+    """
+    state = ctx.user_data.get('_conv_state')
+    if not state:
+        return
+
+    login = ctx.user_data.get('edit_prompt_login')
+    text  = upd.message.text.strip()
+
+    if state == 'edit_account_prompt':
+        acc = storage.get_account(login)
+        cur_tp = acc.get('topic_prompt', '') if acc else ''
+        if text == '-':
+            storage.update_account_prompts(login, '', cur_tp)
+            reply = f"✅ Системный промпт *@{login}* сброшен на дефолтный SLASH VPN"
+        else:
+            storage.update_account_prompts(login, text, cur_tp)
+            reply = f"✅ Системный промпт сохранён для *@{login}*\n\nТеперь все посты будут генерироваться по твоей инструкции."
+        ctx.user_data.pop('_conv_state', None)
+        await upd.message.reply_text(reply, parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Посмотреть промпты",  callback_data=f"acc:show_prompts:{login}")],
+                [InlineKeyboardButton("👤 К аккаунту",          callback_data=f"acc:manage:{login}")],
+            ]))
+
+    elif state == 'edit_topic_prompt':
+        acc = storage.get_account(login)
+        cur_ap = acc.get('account_prompt', '') if acc else ''
+        if text == '-':
+            storage.update_account_prompts(login, cur_ap, '')
+            reply = f"✅ Промпт тем *@{login}* сброшен на дефолтный"
+        else:
+            storage.update_account_prompts(login, cur_ap, text)
+            reply = f"✅ Промпт тем сохранён для *@{login}*\n\nAI будет придумывать темы по твоей инструкции."
+        ctx.user_data.pop('_conv_state', None)
+        await upd.message.reply_text(reply, parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Посмотреть промпты", callback_data=f"acc:show_prompts:{login}")],
+                [InlineKeyboardButton("👤 К аккаунту",         callback_data=f"acc:manage:{login}")],
+            ]))
+
+
+async def universal_photo_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Универсальный обработчик фото — ловит фото отправленное после нажатия кнопки
+    🖼 Загрузить картинку в меню аккаунта.
+    """
+    login = ctx.user_data.get('_waiting_photo_for') or ctx.user_data.get('img_login')
+    if not login:
+        return
+    file = await ctx.bot.get_file(upd.message.photo[-1].file_id)
+    os.makedirs('images', exist_ok=True)
+    path = f"images/{login}.jpg"
+    await file.download_to_drive(path)
+    storage.set_image(login, path)
+    ctx.user_data.pop('_waiting_photo_for', None)
+    ctx.user_data.pop('img_login', None)
+    await upd.message.reply_text(
+        f"✅ Картинка сохранена для *@{login}*\n\nОна будет добавлена к посту 3 (с тарифами) при следующей публикации.",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")
+        ]])
+    )
 
 
 # ─── Планировщик ─────────────────────────────────────────────────────────────
@@ -649,23 +1027,30 @@ async def on_startup(app):
 def build_app():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    app.add_handler(CommandHandler('start',    cmd_start))
-    app.add_handler(CommandHandler('seriya',   cmd_seriya))
-    app.add_handler(CommandHandler('interval', cmd_interval))
+    # ── Простые команды ──────────────────────────────────────────────────────
+    app.add_handler(CommandHandler('start',         cmd_start))
+    app.add_handler(CommandHandler('help',          cmd_help))
+    app.add_handler(CommandHandler('seriya',        cmd_seriya))
+    app.add_handler(CommandHandler('interval',      cmd_interval))
+    app.add_handler(CommandHandler('show_prompts',  cmd_show_prompts))
 
-    app.add_handler(CallbackQueryHandler(cb_menu,      pattern=r'^menu:'))
-    app.add_handler(CallbackQueryHandler(cb_acc,       pattern=r'^acc:'))
-    app.add_handler(CallbackQueryHandler(cb_autopilot, pattern=r'^ap:'))
-    app.add_handler(CallbackQueryHandler(cb_stats,     pattern=r'^stats:'))
-    app.add_handler(CallbackQueryHandler(cb_settings,  pattern=r'^settings:'))
-    app.add_handler(CallbackQueryHandler(cb_queue,     pattern=r'^queue:'))
-    app.add_handler(CallbackQueryHandler(cb_interval,  pattern=r'^interval:'))
+    # ── Callback кнопки ──────────────────────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(cb_menu,       pattern=r'^menu:'))
+    app.add_handler(CallbackQueryHandler(cb_acc,        pattern=r'^acc:'))
+    app.add_handler(CallbackQueryHandler(cb_autopilot,  pattern=r'^ap:'))
+    app.add_handler(CallbackQueryHandler(cb_stats,      pattern=r'^stats:'))
+    app.add_handler(CallbackQueryHandler(cb_settings,   pattern=r'^settings:'))
+    app.add_handler(CallbackQueryHandler(cb_queue,      pattern=r'^queue:'))
+    app.add_handler(CallbackQueryHandler(cb_interval,   pattern=r'^interval:'))
+    app.add_handler(CallbackQueryHandler(cb_selaccount, pattern=r'^selaccount:'))
 
+    # ── /add_account + 2FA ───────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('add_account', cmd_add_account)],
         states={WAIT_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)]},
         fallbacks=[CommandHandler('cancel', conv_cancel)],
     ))
+    # ── /manual_cookies ──────────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('manual_cookies', cmd_manual_cookies)],
         states={
@@ -675,6 +1060,7 @@ def build_app():
         },
         fallbacks=[CommandHandler('cancel', conv_cancel)],
     ))
+    # ── /setup ───────────────────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('setup', cmd_setup)],
         states={
@@ -685,6 +1071,7 @@ def build_app():
         },
         fallbacks=[CommandHandler('cancel', conv_cancel)],
     ))
+    # ── /kartinka ────────────────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('kartinka', cmd_kartinka)],
         states={
@@ -693,6 +1080,27 @@ def build_app():
         },
         fallbacks=[CommandHandler('cancel', conv_cancel)],
     ))
+    # ── /prompt_account — изменить системный промпт ──────────────────────────
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('prompt_account', cmd_prompt_account)],
+        states={
+            WAIT_EDIT_ACCOUNT_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_account_prompt_h)],
+        },
+        fallbacks=[CommandHandler('cancel', conv_cancel)],
+    ))
+    # ── /prompt_topic — изменить промпт тем ─────────────────────────────────
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('prompt_topic', cmd_prompt_topic)],
+        states={
+            WAIT_EDIT_TOPIC_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_topic_prompt_h)],
+        },
+        fallbacks=[CommandHandler('cancel', conv_cancel)],
+    ))
+
+    # ── Универсальные обработчики для inline-редактирования из кнопок ────────
+    # (когда пользователь нажимает ✏️ прямо в меню аккаунта)
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, universal_photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,  universal_message_handler))
 
     return app
 

@@ -7,7 +7,7 @@ import os, time, uuid, json, base64, struct, hmac, hashlib, logging, requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
 from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.hazmat.primitives.serialization import load_der_public_key
+from cryptography.hazmat.primitives.serialization import load_der_public_key, load_pem_public_key
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,25 @@ def get_enc_key(session, csrf, mid):
     return int(r.headers.get("ig-set-password-encryption-key-version","0")), int(enc_header), enc_version.strip()
 
 
+def _load_instagram_pubkey(pub_key_b64: str):
+    """
+    FIX: Instagram иногда возвращает base64(PEM), а не base64(DER).
+    Первый байт PEM — '-' (0x2D), что даёт ASN.1 tag=13, constructed=True, class=Universal
+    и вызывает ошибку 'Could not deserialize key data'.
+    Определяем формат по первым байтам и используем нужный загрузчик.
+    """
+    key_bytes = base64.b64decode(pub_key_b64)
+    if key_bytes.startswith(b'-----'):
+        # Instagram вернул base64(PEM) — декодируем как PEM напрямую
+        return load_pem_public_key(key_bytes)
+    # Стандартный случай: base64(DER)
+    return load_der_public_key(key_bytes)
+
+
 def encrypt_password(password, key_id, key_version, pub_key_b64):
     aes_key = os.urandom(32)
     iv      = os.urandom(12)
-    pub_key = load_der_public_key(base64.b64decode(pub_key_b64))
+    pub_key = _load_instagram_pubkey(pub_key_b64)  # FIX: was load_der_public_key(base64.b64decode(...))
     encrypted_aes_key = pub_key.encrypt(aes_key, OAEP(mgf=MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None))
     timestamp = str(int(time.time()))
     aesgcm = AESGCM(aes_key)
