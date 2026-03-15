@@ -1,61 +1,59 @@
-### threads_api.py  —  DUAL-LIBRARY WITH AUTO-FALLBACK
+### threads_api.py — instagrapi auth + metathreads operations
 #
-# Все операции: сначала metathreads, при ошибке автоматически Danie1/threads-api.
-# Публикация: сначала Danie1 (поддерживает image + reply_to), fallback metathreads.
+# Auth: instagrapi (sessionid, password+2FA, TOTP, session file)
+# Threads operations: metathreads (like, follow, search, repost, replies, stats)
+# Image posting: instagrapi private API → Threads configure endpoint
 #
-# BUG-01: follow() вместо follow_user() в metathreads
-# BUG-02: _post_with_reply_metathreads() для reply_to (metathreads не поддерживает)
-# BUG-03: logged_in_user явно после cookie-auth
-# BUG-04: _activate_client() перед каждым вызовом metathreads (глобальная сессия)
-# BUG-05..08: _parse_users/threads/replies/stats() — распаковка dict-ответов
-# BUG-09: add_account_manual через metathreads.get_user_id()
-# BUG-10: _pk() safe fallback
+# AUTH_TYPE_INSTAGRAPI — новый тип (заменяет danie1)
+# AUTH_TYPE_COOKIE     — ручной ввод cookies (manual_cookies)
+# AUTH_TYPE_BLOKS      — legacy metathreads bloks (fallback)
 
 import os, time, random, logging, datetime, json, asyncio
 from dotenv import load_dotenv
 import storage
 import threads_auth
-from threads_auth import TwoFactorRequired, BloksLoginFailed
-
-AUTH_TYPE_BLOKS  = 'bloks'
-AUTH_TYPE_COOKIE = 'cookie'
-AUTH_TYPE_DANIE1 = 'danie1'
+from threads_auth import TwoFactorRequired, LoginFailed
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-_clients: dict    = {}   # login -> { client, username, user_id, login }
-_pending_2fa: dict = {}  # login -> { login, password }
+AUTH_TYPE_INSTAGRAPI = 'instagrapi'
+AUTH_TYPE_COOKIE     = 'cookie'
+AUTH_TYPE_BLOKS      = 'bloks'
+
+# login → { client, ig_client, username, user_id, login }
+_clients: dict     = {}
+# login → { login, password, ig_client } — ожидание кода 2FA
+_pending_2fa: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ: СЕССИЯ, ПАРСЕРЫ, PK
+#  METATHREADS — ВСПОМОГАТЕЛЬНЫЕ
 # ══════════════════════════════════════════════════════════════
 
-def _activate_client(client):
-    """Устанавливаем сессию нужного аккаунта в глобальный config metathreads."""
+def _activate_client(mt_client):
     try:
         from metathreads import config
-        config._DEFAULT_SESSION = client.session
+        config._DEFAULT_SESSION = mt_client.session
     except Exception:
         pass
 
 
-def _parse_users(response) -> list:
-    if not response: return []
-    if isinstance(response, list): return response
-    if isinstance(response, dict):
-        users = response.get('users', [])
-        if isinstance(users, list): return users
+def _parse_users(resp) -> list:
+    if not resp: return []
+    if isinstance(resp, list): return resp
+    if isinstance(resp, dict):
+        u = resp.get('users', [])
+        if isinstance(u, list): return u
     return []
 
 
-def _parse_threads(response) -> list:
-    if not response: return []
-    if isinstance(response, list): return response
+def _parse_threads(resp) -> list:
+    if not resp: return []
+    if isinstance(resp, list): return resp
     posts = []
-    if isinstance(response, dict):
-        for t in (response.get('threads', []) or []):
+    if isinstance(resp, dict):
+        for t in (resp.get('threads', []) or []):
             if not isinstance(t, dict): continue
             for item in (t.get('thread_items', []) or []):
                 post = item.get('post', item) if isinstance(item, dict) else item
@@ -63,13 +61,13 @@ def _parse_threads(response) -> list:
     return posts
 
 
-def _parse_replies(response) -> list:
-    if not response: return []
-    if isinstance(response, list): return response
+def _parse_replies(resp) -> list:
+    if not resp: return []
+    if isinstance(resp, list): return resp
     posts = []
-    if isinstance(response, dict):
+    if isinstance(resp, dict):
         for key in ('reply_threads', 'containing_thread', 'threads'):
-            bucket = response.get(key, [])
+            bucket = resp.get(key, [])
             if isinstance(bucket, dict): bucket = [bucket]
             for t in (bucket or []):
                 if not isinstance(t, dict): continue
@@ -77,15 +75,15 @@ def _parse_replies(response) -> list:
                     post = item.get('post', item) if isinstance(item, dict) else item
                     if post: posts.append(post)
         if not posts:
-            for val in response.values():
+            for val in resp.values():
                 if isinstance(val, list) and val:
                     posts = val; break
     return posts
 
 
-def _parse_stats(response) -> dict:
-    if not response or not isinstance(response, dict): return {}
-    ct = response.get('containing_thread', {})
+def _parse_stats(resp) -> dict:
+    if not resp or not isinstance(resp, dict): return {}
+    ct = resp.get('containing_thread', {})
     if isinstance(ct, dict):
         items = ct.get('thread_items', [])
         if items and isinstance(items[0], dict):
@@ -98,160 +96,251 @@ def _parse_stats(response) -> dict:
                     'reposts': post.get('repost_count', 0),
                 }
     return {
-        'likes':   response.get('like_count', 0),
-        'replies': response.get('reply_count', 0),
-        'reposts': response.get('repost_count', 0),
+        'likes':   resp.get('like_count', 0),
+        'replies': resp.get('reply_count', 0),
+        'reposts': resp.get('repost_count', 0),
     }
 
 
-def _pk(response) -> str:
-    if response is None: return ''
-    if isinstance(response, bool): return ''
-    if isinstance(response, dict):
-        pk = (response.get('media', {}) or {}).get('pk')
+def _pk(resp) -> str:
+    if resp is None: return ''
+    if isinstance(resp, bool): return ''
+    if isinstance(resp, dict):
+        pk = (resp.get('media', {}) or {}).get('pk')
         if pk: return str(pk)
-        pk = response.get('pk')
+        pk = resp.get('pk')
         if pk: return str(pk)
-    return str(response) if response else ''
+    return str(resp) if resp else ''
 
 
 # ══════════════════════════════════════════════════════════════
-#  DANIE1 / THREADS-API — КЛИЕНТ
-# ══════════════════════════════════════════════════════════════
-
-def _get_danie1_client(account_login: str):
-    """
-    Возвращает ThreadsAPI с Bearer token из settings.
-    None если токена нет.
-    """
-    try:
-        from threads_api.src.threads_api import ThreadsAPI
-        token_key = f'threads_api_token:{account_login}'
-        token     = storage.get_setting(token_key)
-        if not token:
-            return None
-        acc = storage.get_account(account_login) or {}
-        api              = ThreadsAPI()
-        api.token        = token
-        api.user_id      = acc.get('user_id', '')
-        api.is_logged_in = True
-        api.auth_headers = {
-            'Authorization': f'Bearer IGT:2:{token}',
-            'User-Agent':    'Barcelona 289.0.0.77.109 Android',
-            'Content-Type':  'application/x-www-form-urlencoded; charset=UTF-8',
-        }
-        return api
-    except Exception as e:
-        logger.debug(f"_get_danie1_client({account_login}): {e}")
-        return None
-
-
-# ══════════════════════════════════════════════════════════════
-#  METATHREADS — ПУБЛИКАЦИЯ С REPLY_TO
-# ══════════════════════════════════════════════════════════════
-
-def _post_with_reply_metathreads(client, caption: str, reply_to: str = None) -> dict:
-    """
-    metathreads.post_thread() не поддерживает reply_to — собираем запрос вручную.
-    """
-    from metathreads.constants import Setting, Path
-    from metathreads.request_util import generate_request_data
-
-    upload_id = int(datetime.datetime.now().microsecond * datetime.datetime.now().microsecond)
-    text_post_info: dict = {"reply_control": 0}
-    if reply_to:
-        text_post_info["reply_id"] = str(reply_to)
-
-    data = {
-        "publish_mode": "text_post",
-        "upload_id": upload_id,
-        "text_post_app_info": text_post_info,
-        "timezone_offset": 0,
-        "_uid": client.user_id,
-        "device_id": Setting.ANDROID_ID,
-        "_uuid": Setting.DEVICE_ID,
-        "caption": caption,
-        "audience": "default",
-    }
-    signed_data = {"signed_body": f"SIGNATURE.{json.dumps(data)}"}
-    _activate_client(client)
-    return generate_request_data(Path.POST_THREAD, data=signed_data, method="POST")
-
-
-# ══════════════════════════════════════════════════════════════
-#  СОЗДАНИЕ КЛИЕНТА И ЗАГРУЗКА ИЗ БД
+#  METATHREADS — СОЗДАНИЕ КЛИЕНТА
 # ══════════════════════════════════════════════════════════════
 
 def _make_metathreads_client(session_id: str, csrf_token: str,
                               user_id: str, username: str,
                               auth_type: str = 'cookie'):
     from metathreads import MetaThreads
-    client = MetaThreads()
+    cl = MetaThreads()
     if auth_type == AUTH_TYPE_BLOKS:
-        if session_id: client.session.headers.update({'Authorization': session_id})
-        if csrf_token: client.session.headers.update({'X-Mid': csrf_token})
+        if session_id: cl.session.headers.update({'Authorization': session_id})
+        if csrf_token: cl.session.headers.update({'X-Mid': csrf_token})
     else:
-        client.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
-    client.logged_in_user = {'pk': user_id, 'username': username}
-    return client
+        cl.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
+    cl.logged_in_user = {'pk': user_id, 'username': username}
+    return cl
 
 
-def _make_metathreads_from_danie1_token(token: str, user_id: str, username: str):
-    """
-    Создаём metathreads-клиент из Danie1 Bearer-токена.
-    Danie1 хранит сырой токен; metathreads принимает его через Authorization header
-    в формате 'Bearer IGT:2:<token>' — тот же формат, что использует Bloks.
-    Это даёт аккаунту полный функционал обеих библиотек.
-    """
+def _make_metathreads_from_token(bearer_token: str, user_id: str, username: str):
+    """Создаём metathreads-клиент из Bearer-токена (instagrapi или Bloks)."""
     from metathreads import MetaThreads
-    client = MetaThreads()
-    client.session.headers.update({'Authorization': f'Bearer IGT:2:{token}'})
-    client.logged_in_user = {'pk': user_id, 'username': username}
-    logger.debug(f"metathreads-клиент из Danie1-токена: user_id={user_id}, username={username}")
-    return client
+    cl = MetaThreads()
+    if bearer_token:
+        cl.session.headers.update({'Authorization': bearer_token})
+    cl.logged_in_user = {'pk': user_id, 'username': username}
+    return cl
 
+
+def _make_metathreads_from_sessionid(sessionid: str, csrftoken: str,
+                                      user_id: str, username: str):
+    """Создаём metathreads-клиент из sessionid cookie."""
+    from metathreads import MetaThreads
+    cl = MetaThreads()
+    cl.session.cookies.update({'sessionid': sessionid, 'csrftoken': csrftoken})
+    cl.logged_in_user = {'pk': user_id, 'username': username}
+    return cl
+
+
+# ══════════════════════════════════════════════════════════════
+#  INSTAGRAPI — ПОЛУЧИТЬ КЛИЕНТ ИЗ ХРАНИЛИЩА
+# ══════════════════════════════════════════════════════════════
+
+def _get_ig_client(login: str):
+    """
+    Возвращает живой instagrapi Client для аккаунта.
+    Сначала смотрим в памяти (_clients[login]['ig_client']),
+    потом пробуем восстановить из session-файла.
+    """
+    entry = _clients.get(login, {})
+    ig = entry.get('ig_client')
+    if ig:
+        return ig
+
+    # Пробуем восстановить из session-файла
+    session_file = threads_auth._session_path(login)
+    if not os.path.exists(session_file):
+        return None
+
+    try:
+        from instagrapi import Client
+        cl = Client()
+        cl.delay_range = [1, 3]
+        cl.set_settings(cl.load_settings(session_file))
+        # Обновляем в памяти
+        if login in _clients:
+            _clients[login]['ig_client'] = cl
+        logger.info(f"[{login}] instagrapi восстановлен из session-файла ✓")
+        return cl
+    except Exception as e:
+        logger.warning(f"[{login}] instagrapi не восстановлен: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  IMAGE POSTING — instagrapi private API → Threads endpoint
+# ══════════════════════════════════════════════════════════════
+
+def _post_image_to_threads(ig_cl, caption: str, image_path: str,
+                            reply_to: str = None) -> str:
+    """
+    Публикует тред с изображением через instagrapi private session.
+    Использует Instagram rupload endpoint + Threads configure endpoint.
+    Возвращает media_pk (строка) или '' при ошибке.
+    """
+    upload_id = str(int(time.time() * 1000))
+
+    # Step 1: загружаем фото
+    with open(image_path, 'rb') as f:
+        photo_data = f.read()
+
+    rupload_params = json.dumps({
+        'upload_id': upload_id,
+        'media_type': 1,
+        'retry_context': json.dumps({
+            'num_reupload': 0, 'num_step_auto_retry': 0, 'num_step_manual_retry': 0
+        }),
+    })
+
+    r = ig_cl.private.post(
+        f'https://i.instagram.com/rupload_igphoto/{upload_id}',
+        data=photo_data,
+        headers={
+            'X-Entity-Type': 'image/jpeg',
+            'Offset': '0',
+            'X-Instagram-Rupload-Params': rupload_params,
+            'X-Entity-Name': f'fb_uploader_{upload_id}',
+            'X-Entity-Length': str(len(photo_data)),
+            'Content-Type': 'application/octet-stream',
+        }
+    )
+    r.raise_for_status()
+    logger.debug(f"Photo uploaded: {r.json()}")
+
+    # Step 2: конфигурируем как Threads пост
+    text_post_info: dict = {'reply_control': 0}
+    if reply_to:
+        text_post_info['reply_id'] = str(reply_to)
+
+    data = {
+        'caption':           caption,
+        'upload_id':         upload_id,
+        'publish_mode':      'media_post',
+        'text_post_app_info': json.dumps(text_post_info),
+        'timezone_offset':   '0',
+        'audience':          'default',
+        '_uid':              str(ig_cl.user_id),
+        '_uuid':             ig_cl.uuid,
+        'device_id':         ig_cl.android_id,
+    }
+    signed = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
+
+    r2 = ig_cl.private.post(
+        'https://www.threads.net/api/v1/media/configure_text_post_app_feed/',
+        data=signed,
+    )
+    r2.raise_for_status()
+    result = r2.json()
+    return str((result.get('media') or {}).get('pk', ''))
+
+
+# ══════════════════════════════════════════════════════════════
+#  METATHREADS — ПУБЛИКАЦИЯ С REPLY_TO (текст)
+# ══════════════════════════════════════════════════════════════
+
+def _post_with_reply_metathreads(client, caption: str, reply_to: str = None) -> dict:
+    from metathreads.constants import Setting, Path
+    from metathreads.request_util import generate_request_data
+
+    upload_id = int(datetime.datetime.now().microsecond * datetime.datetime.now().microsecond)
+    text_post_info: dict = {'reply_control': 0}
+    if reply_to:
+        text_post_info['reply_id'] = str(reply_to)
+
+    data = {
+        'publish_mode': 'text_post',
+        'upload_id': upload_id,
+        'text_post_app_info': text_post_info,
+        'timezone_offset': 0,
+        '_uid': client.user_id,
+        'device_id': Setting.ANDROID_ID,
+        '_uuid': Setting.DEVICE_ID,
+        'caption': caption,
+        'audience': 'default',
+    }
+    signed_data = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
+    _activate_client(client)
+    return generate_request_data(Path.POST_THREAD, data=signed_data, method='POST')
+
+
+# ══════════════════════════════════════════════════════════════
+#  ЗАГРУЗКА АККАУНТОВ ИЗ БД
+# ══════════════════════════════════════════════════════════════
 
 def load_accounts_from_db():
     for acc_ref in storage.get_all_accounts():
         acc = storage.get_account(acc_ref['login'])
         if not acc:
             continue
-        if acc.get('auth_type') == AUTH_TYPE_DANIE1:
-            # Восстанавливаем metathreads-клиент из сохранённого Danie1-токена
-            mt_client = None
-            token = storage.get_setting(f'threads_api_token:{acc["login"]}')
-            if token and acc.get('user_id') and acc.get('username'):
-                try:
-                    mt_client = _make_metathreads_from_danie1_token(
-                        token, acc['user_id'], acc['username']
-                    )
-                except Exception as e:
-                    logger.warning(f"metathreads из токена ({acc['login']}): {e}")
-            _clients[acc['login']] = {
-                'client':   mt_client,
-                'username': acc.get('username', acc['login']),
-                'user_id':  acc.get('user_id', acc['login']),
-                'login':    acc['login'],
-            }
-            mode = 'hybrid ✓' if mt_client else 'Danie1-only'
-            logger.info(f"Загружен ({mode}): {acc['login']}")
-            continue
-        if acc.get('session_id'):
+        login    = acc['login']
+        username = acc.get('username', login)
+        user_id  = acc.get('user_id', login)
+        auth     = acc.get('auth_type', AUTH_TYPE_COOKIE)
+
+        mt_client = None
+        ig_client  = None
+
+        # Восстанавливаем instagrapi из session-файла
+        session_file = threads_auth._session_path(login)
+        if os.path.exists(session_file):
             try:
-                client = _make_metathreads_client(
-                    acc['session_id'], acc['csrf_token'],
-                    acc['user_id'],    acc['username'],
-                    auth_type=acc.get('auth_type', 'cookie'),
-                )
-                _clients[acc['login']] = {
-                    'client':   client,
-                    'username': acc['username'],
-                    'user_id':  acc['user_id'],
-                    'login':    acc['login'],
-                }
-                logger.info(f"Загружен: {acc['login']}")
+                from instagrapi import Client
+                ig = Client()
+                ig.delay_range = [1, 3]
+                ig.set_settings(ig.load_settings(session_file))
+                ig_client = ig
+                logger.info(f"[{login}] instagrapi session восстановлена ✓")
             except Exception as e:
-                logger.warning(f"Не удалось загрузить {acc['login']}: {e}")
+                logger.warning(f"[{login}] instagrapi session: {e}")
+
+        # Строим metathreads-клиент
+        try:
+            sid = acc.get('session_id', '')
+            csrf = acc.get('csrf_token', '')
+
+            if auth == AUTH_TYPE_INSTAGRAPI and ig_client:
+                # Из Bearer-токена instagrapi
+                bearer = threads_auth._extract_bearer(ig_client)
+                mt_client = _make_metathreads_from_token(bearer, user_id, username)
+            elif auth == AUTH_TYPE_BLOKS and sid:
+                mt_client = _make_metathreads_client(sid, csrf, user_id, username, AUTH_TYPE_BLOKS)
+            elif sid:
+                mt_client = _make_metathreads_client(sid, csrf, user_id, username, AUTH_TYPE_COOKIE)
+        except Exception as e:
+            logger.warning(f"[{login}] metathreads клиент: {e}")
+
+        _clients[login] = {
+            'client':    mt_client,
+            'ig_client': ig_client,
+            'username':  username,
+            'user_id':   user_id,
+            'login':     login,
+        }
+
+        has_mt = mt_client is not None
+        has_ig = ig_client is not None
+        mode = 'full' if (has_mt and has_ig) else ('mt-only' if has_mt else ('ig-only' if has_ig else 'empty'))
+        logger.info(f"Загружен [{mode}]: {login}")
+
     logger.info(f"Загружено аккаунтов: {len(_clients)}")
 
 
@@ -261,290 +350,173 @@ def load_accounts_from_db():
 
 def add_account(login: str, password: str) -> dict:
     """
-    Цепочка авторизации:
-      1. Bloks API (metathreads) — быстро, но нестабильно
-      2. Danie1 (threads-api)   — fallback при ЛЮБОЙ ошибке Bloks
-    2FA перехватывается на каждом уровне и поднимается наверх.
+    Логин через instagrapi.
+    При 2FA — raise TwoFactorRequired (pending_2fa сохраняет password + ig_client).
     """
-    logger.info(f"[{login}] Авторизация через Bloks API...")
+    logger.info(f"[{login}] Логин через instagrapi...")
     try:
         result = threads_auth.login(login, password)
-        return _save_from_bloks_result(login, result)
-    except TwoFactorRequired:
-        # Bloks поймал 2FA — сохраняем pending и поднимаем наверх
-        _pending_2fa[login] = {'login': login, 'password': password, 'method': 'bloks'}
+        return _save_from_instagrapi_result(login, password, result)
+    except TwoFactorRequired as e:
+        _pending_2fa[login] = {
+            'login':     login,
+            'password':  password,
+            'ig_client': e.client,
+        }
+        storage.save_pending_2fa(login, password, 'instagrapi')
         raise
-    except Exception as e:
-        # Timeout, checkpoint, BloksLoginFailed и всё остальное → пробуем Danie1
-        err_str = str(e).lower()
-        # Checkpoint/challenge — смысла нет пробовать Danie1
-        if any(k in err_str for k in ('checkpoint', 'challenge', 'подтверждение входа')):
-            raise
-        logger.warning(f"[{login}] Bloks недоступен ({type(e).__name__}), пробую Danie1...")
-        return _add_account_via_danie1(login, password)
+    except LoginFailed as e:
+        raise Exception(str(e))
 
 
 def confirm_2fa(login: str, code: str) -> dict:
+    """Завершение 2FA. Восстанавливает pending из памяти или предлагает повтор."""
     if login not in _pending_2fa:
-        raise Exception("Сессия 2FA не найдена. Начни заново с /add_account.")
-    pending = _pending_2fa[login]
-    method  = pending.get('method', 'bloks')
-
-    if method == 'danie1':
-        return _confirm_2fa_danie1_sync(login, code)
-
-    # Bloks 2FA — стандартный путь (metathreads)
-    password = pending.get('password', '')
-    try:
-        result = threads_auth.login(login, password)
-        _pending_2fa.pop(login, None)
-        return _save_from_bloks_result(login, result)
-    except TwoFactorRequired:
-        # Ещё раз запросил 2FA — значит код неверный
-        raise Exception("Неверный код 2FA. Попробуй ещё раз.")
-    except Exception as e:
-        _pending_2fa.pop(login, None)
-        raise Exception(f"Bloks 2FA не подтвердилась: {e}\n\nИспользуй /manual_cookies")
-
-
-def _add_account_via_danie1(login: str, password: str) -> dict:
-    """Синхронная обёртка для Danie1-логина. Пробрасывает TwoFactorRequired наверх."""
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(_add_account_danie1_async(login, password))
-        finally:
-            loop.close()
-    except TwoFactorRequired:
-        raise  # пробрасываем 2FA наверх без оборачивания
-    except Exception as e:
-        err = str(e)
-        raise Exception(
-            f"Не удалось войти через Danie1: {err}\n\n"
-            "Что делать:\n"
-            "• Подожди 15-30 минут (Instagram блокирует после нескольких попыток)\n"
-            "• Или используй /manual_cookies — это всегда работает"
-        )
-
-
-async def _add_account_danie1_async(login: str, password: str) -> dict:
-    """Логин через Danie1 + hybrid metathreads-клиент. Поддерживает 2FA."""
-    from threads_api.src.threads_api import ThreadsAPI
-    api = ThreadsAPI()
-    try:
-        ok = await api.login(login, password)
-    except Exception as exc:
-        err = str(exc).lower()
-        # Danie1 бросает исключение при 2FA — ловим и переходим в pending
-        if any(k in err for k in ('two_factor', '2fa', 'two factor', 'verification')):
-            # Вытаскиваем identifier из исключения (разные версии библиотеки кладут по-разному)
-            tf_id = (getattr(exc, 'two_factor_identifier', None)
-                     or getattr(exc, 'two_factor_info', {}).get('two_factor_identifier', '')
-                     or '')
+        saved = storage.get_pending_2fa(login)
+        if saved:
+            logger.info(f"[{login}] pending_2fa восстановлен из БД")
             _pending_2fa[login] = {
-                'login':    login,
-                'password': password,
-                'method':   'danie1',
-                'api':      api,       # сохраняем живой объект — нужен для confirm
-                'tf_id':    str(tf_id),
+                'login':     saved['login'],
+                'password':  saved['password'],
+                'ig_client': None,  # потерян при рестарте
             }
-            logger.info(f"[{login}] Danie1 требует 2FA. tf_id={tf_id}")
-            raise TwoFactorRequired(login)
-        raise  # другая ошибка — пробрасываем
+        else:
+            raise Exception(
+                "Сессия 2FA не найдена.\n\n"
+                "Код истёк или бот был перезапущен.\n"
+                "Начни заново: /add_account"
+            )
 
-    if not ok or not getattr(api, 'token', None):
-        raise Exception("Неверный логин или пароль (Danie1).")
+    pending   = _pending_2fa[login]
+    password  = pending.get('password', '')
+    ig_client = pending.get('ig_client')
 
-    return await _finalize_danie1_login(login, api)
-
-
-async def _finalize_danie1_login(login: str, api) -> dict:
-    """Сохраняет токен и создаёт hybrid-клиент после успешного Danie1-логина."""
-    token    = api.token
-    user_id  = str(getattr(api, 'user_id',  None) or '')
-    username = str(getattr(api, 'username', None) or login)
-
-    storage.set_setting(f'threads_api_token:{login}', token)
-
-    mt_client = None
-    try:
-        mt_client = _make_metathreads_from_danie1_token(token, user_id or login, username)
-        logger.info(f"[{login}] metathreads hybrid-клиент создан ✓")
-    except Exception as e:
-        logger.warning(f"[{login}] metathreads из токена не создан: {e}")
-
-    _clients[login] = {
-        'client':   mt_client,
-        'username': username,
-        'user_id':  user_id or login,
-        'login':    login,
-    }
-    storage.save_account({
-        'login':      login,
-        'session_id': token,
-        'csrf_token': '',
-        'user_id':    user_id or login,
-        'username':   username,
-        'auth_type':  AUTH_TYPE_DANIE1,
-    })
-    mode = 'hybrid' if mt_client else 'Danie1-only'
-    logger.info(f"[{login}] Добавлен через Danie1 ({mode}). username={username}")
-    return {'login': login, 'username': username}
-
-
-def _confirm_2fa_danie1_sync(login: str, code: str) -> dict:
-    """Синхронная обёртка для Danie1 2FA-подтверждения."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(_confirm_2fa_danie1_async(login, code))
-    finally:
-        loop.close()
-
-
-async def _confirm_2fa_danie1_async(login: str, code: str) -> dict:
-    """Завершаем Danie1-логин с кодом 2FA."""
-    pending = _pending_2fa.get(login, {})
-    api     = pending.get('api')
-    tf_id   = pending.get('tf_id', '')
-
-    if not api:
-        raise Exception("Сессия Danie1 2FA не найдена. Начни заново с /add_account.")
-
-    # Пробуем разные варианты метода 2FA — разные версии библиотеки
-    ok = False
-    for method_name in ('two_factor_login', 'handle_two_factor_login', 'verify_two_factor'):
-        fn = getattr(api, method_name, None)
-        if fn is None:
-            continue
-        try:
-            ok = await fn(login, code.strip(), tf_id)
-            if ok:
-                break
-        except Exception as e:
-            logger.warning(f"[{login}] {method_name}() ошибка: {e}")
-            raise Exception(f"Неверный код 2FA или сессия истекла.\n\nОшибка: {e}")
-
-    if not ok or not getattr(api, 'token', None):
+    if not ig_client:
+        # Рестарт бота — нужен новый логин чтобы получить свежую 2FA сессию
+        _pending_2fa.pop(login, None)
+        storage.delete_pending_2fa(login)
         raise Exception(
-            "Код 2FA не принят.\n\n"
-            "Проверь:\n"
-            "• Правильность кода (он одноразовый!)\n"
-            "• Код не устарел (действует ~30 секунд)\n\n"
-            "Если не получается — используй /manual_cookies"
+            "Сессия 2FA потеряна (бот был перезапущен).\n\n"
+            "Введи /add_account снова — придёт новый код 2FA."
         )
 
-    _pending_2fa.pop(login, None)
-    return await _finalize_danie1_login(login, api)
+    try:
+        result = threads_auth.confirm_2fa(ig_client, login, password, code)
+        _pending_2fa.pop(login, None)
+        storage.delete_pending_2fa(login)
+        return _save_from_instagrapi_result(login, password, result)
+    except Exception:
+        raise
 
 
-def add_account_manual(login, session_id, csrf_token):
-    """Добавление через cookies браузера. Профиль получаем через metathreads."""
+def add_account_manual(login: str, session_id: str, csrf_token: str) -> dict:
+    """Добавление через sessionid из браузера."""
     user_id  = ''
     username = login
+
+    # Сначала пробуем instagrapi login_by_sessionid
+    ig_client = None
     try:
-        from metathreads import MetaThreads
-        tmp = MetaThreads()
-        tmp.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
-        _activate_client(tmp)
-        resolved_id = tmp.get_user_id(login)
-        if resolved_id:
-            user_id = str(resolved_id)
+        result = threads_auth.login_by_sessionid(login, session_id, csrf_token)
+        user_id   = result.get('user_id', '')
+        username  = result.get('username', login)
+        ig_client = result.get('client')
+    except Exception as e:
+        logger.warning(f"[{login}] instagrapi by sessionid: {e}")
+
+    # Fallback: metathreads для получения user_id/username
+    if not user_id:
         try:
+            from metathreads import MetaThreads
+            tmp = MetaThreads()
+            tmp.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
+            _activate_client(tmp)
+            resolved = tmp.get_user_id(login)
+            if resolved:
+                user_id = str(resolved)
             user_data = tmp.get_user(login)
             if isinstance(user_data, list) and user_data:
                 user_data = user_data[0]
             if isinstance(user_data, dict):
                 u = (user_data.get('data', {}) or {}).get('user', {}) or user_data
                 username = u.get('username', login)
-        except Exception:
-            pass
-        logger.info(f"[{login}] Профиль: user_id={user_id}, username={username}")
-    except Exception as e:
-        logger.warning(f"[{login}] Профиль не получен (продолжаем): {e}")
+        except Exception as e:
+            logger.warning(f"[{login}] metathreads profile: {e}")
 
-    client = _make_metathreads_client(session_id, csrf_token, user_id, username)
+    mt_client = _make_metathreads_client(session_id, csrf_token, user_id, username)
     _clients[login] = {
-        'client':   client,
-        'username': username,
-        'user_id':  user_id,
-        'login':    login,
+        'client':    mt_client,
+        'ig_client': ig_client,
+        'username':  username,
+        'user_id':   user_id,
+        'login':     login,
     }
     storage.save_account({
-        'login': login, 'session_id': session_id,
-        'csrf_token': csrf_token, 'user_id': user_id,
-        'username': username, 'auth_type': AUTH_TYPE_COOKIE,
+        'login':      login,
+        'session_id': session_id,
+        'csrf_token': csrf_token,
+        'user_id':    user_id,
+        'username':   username,
+        'auth_type':  AUTH_TYPE_COOKIE,
     })
     logger.info(f"[{login}] Добавлен через cookies. username={username}")
     return {'login': login, 'username': username}
 
 
-def _save_from_bloks_result(login: str, result: dict) -> dict:
-    auth_token = result.get('auth_token', '')
-    mid_token  = result.get('mid_token', '')
-    user_id    = result.get('user_id', '')
-    username   = result.get('username', login)
+def _save_from_instagrapi_result(login: str, password: str, result: dict) -> dict:
+    """Сохраняет аккаунт после успешного instagrapi-логина."""
+    ig_client = result.get('client')
+    user_id   = result.get('user_id', login)
+    username  = result.get('username', login)
+    sessionid = result.get('sessionid', '')
+    csrftoken = result.get('csrftoken', '')
+    bearer    = result.get('auth_token', '')
 
-    existing_client = result.get('client')
-    if existing_client:
-        client = existing_client
-        if not client.logged_in_user:
-            client.logged_in_user = {'pk': user_id, 'username': username}
-    else:
-        client = _make_metathreads_client(auth_token, mid_token, user_id, username, AUTH_TYPE_BLOKS)
+    # metathreads-клиент из Bearer-токена
+    mt_client = None
+    try:
+        mt_client = _make_metathreads_from_token(bearer, user_id, username)
+    except Exception as e:
+        logger.warning(f"[{login}] metathreads из токена: {e}")
 
     _clients[login] = {
-        'client':   client,
-        'username': username,
-        'user_id':  user_id,
-        'login':    login,
-    }
-    storage.save_account({
-        'login':     login,
-        'session_id': auth_token,
-        'csrf_token': mid_token,
-        'user_id':   user_id,
+        'client':    mt_client,
+        'ig_client': ig_client,
         'username':  username,
-        'auth_type': AUTH_TYPE_BLOKS,
-    })
-    logger.info(f"[{login}] Сохранён (Bloks). username={username}")
-    return {'login': login, 'username': username}
-
-
-def _save_from_result(login, result):
-    client = _make_metathreads_client(
-        result['session_id'], result['csrf_token'],
-        result['user_id'],    result['username'],
-    )
-    _clients[login] = {
-        'client':   client,
-        'username': result['username'],
-        'user_id':  result['user_id'],
-        'login':    login,
-    }
-    storage.save_account({'login': login, **result})
-    return {'login': login, 'username': result['username']}
-
-
-def _save_from_client_obj(login, client):
-    cookies    = client.session.cookies.get_dict()
-    session_id = cookies.get('sessionid', '')
-    csrf_token = cookies.get('csrftoken', '')
-    me         = client.me or {}
-    user_id    = str(me.get('pk') or me.get('id', ''))
-    username   = me.get('username', login)
-    if not client.logged_in_user:
-        client.logged_in_user = {'pk': user_id, 'username': username}
-    _clients[login] = {
-        'client': client, 'username': username, 'user_id': user_id, 'login': login,
+        'user_id':   user_id,
+        'login':     login,
     }
     storage.save_account({
-        'login': login, 'session_id': session_id, 'csrf_token': csrf_token,
-        'user_id': user_id, 'username': username,
+        'login':      login,
+        'session_id': bearer or sessionid,
+        'csrf_token': csrftoken,
+        'user_id':    user_id,
+        'username':   username,
+        'auth_type':  AUTH_TYPE_INSTAGRAPI,
     })
+    logger.info(f"[{login}] Сохранён. username={username}")
     return {'login': login, 'username': username}
 
+
+# ══════════════════════════════════════════════════════════════
+#  ОБНОВЛЕНИЕ ТОКЕНА (кнопка "🔄 Обновить токен")
+# ══════════════════════════════════════════════════════════════
+
+async def refresh_token(login: str, password: str) -> bool:
+    """Перелогин через instagrapi, обновляем клиенты в памяти."""
+    try:
+        result = await asyncio.to_thread(threads_auth.login, login, password)
+        _save_from_instagrapi_result(login, password, result)
+        logger.info(f"[{login}] Токен обновлён ✓")
+        return True
+    except Exception as e:
+        logger.warning(f"[{login}] Обновление токена: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ — GET CLIENT, LIST
+# ══════════════════════════════════════════════════════════════
 
 def get_client(login=None) -> dict:
     if login and login in _clients:
@@ -561,37 +533,6 @@ def list_accounts() -> list:
     return list(_clients.keys())
 
 
-async def login_danie1(login: str, password: str) -> bool:
-    """Получаем Bearer token Danie1 для image-постинга + обновляем metathreads hybrid-клиент."""
-    try:
-        from threads_api.src.threads_api import ThreadsAPI
-        api = ThreadsAPI()
-        ok  = await api.login(login, password)
-        if ok and api.token:
-            token    = api.token
-            user_id  = str(getattr(api, 'user_id', None) or '')
-            username = str(getattr(api, 'username', None) or login)
-            storage.set_setting(f'threads_api_token:{login}', token)
-
-            # Обновляем metathreads-клиент в памяти если аккаунт уже загружен
-            try:
-                mt_client = _make_metathreads_from_danie1_token(
-                    token, user_id or login, username
-                )
-                if login in _clients:
-                    _clients[login]['client'] = mt_client
-                    logger.info(f"[{login}] metathreads hybrid-клиент обновлён ✓")
-            except Exception as e:
-                logger.warning(f"[{login}] metathreads обновить не удалось: {e}")
-
-            logger.info(f"[{login}] Danie1 Bearer token сохранён")
-            return True
-        return False
-    except Exception as e:
-        logger.warning(f"[{login}] Danie1 login: {e}")
-        return False
-
-
 # ══════════════════════════════════════════════════════════════
 #  ПУБЛИКАЦИЯ СЕРИИ
 # ══════════════════════════════════════════════════════════════
@@ -599,259 +540,126 @@ async def login_danie1(login: str, password: str) -> bool:
 async def post_series_async(posts: dict, image_path: str = None,
                             account_login: str = None) -> list:
     """
-    Публикация серии 4 постов.
-    Порядок: Danie1 (image+reply) → metathreads (текст+reply) → Exception
+    Публикует 4 поста.
+    post1/2/4 — текст через metathreads (reply_to цепочка).
+    post3 — с картинкой через instagrapi → fallback: текст через metathreads.
     """
     entry     = get_client(account_login)
     login     = entry['login']
     mt_client = entry['client']
+    ig_client = entry.get('ig_client') or _get_ig_client(login)
+
+    if not mt_client:
+        raise Exception(
+            f"Аккаунт {login} не инициализирован.\n"
+            "Используй /add_account или /manual_cookies."
+        )
 
     logger.info(f"[{login}] Публикую серию: {posts.get('topic', '—')}")
-
-    # 1. Пробуем Danie1 (поддерживает картинку и reply_to)
-    danie1_api = _get_danie1_client(login)
-    if danie1_api:
-        try:
-            ids = await _post_series_danie1(danie1_api, posts, image_path, login)
-            logger.info(f"[{login}] ✓ Опубликовано через Danie1")
-            return ids
-        except Exception as e:
-            logger.warning(f"[{login}] Danie1 упал ({e}), переключаюсь на metathreads...")
-
-    # 2. Fallback: metathreads (если аккаунт не только Danie1)
-    if mt_client is None:
-        raise Exception(
-            "Аккаунт добавлен через Danie1; токен истёк или недоступен. "
-            "Используй /add_account с паролем заново или /manual_cookies."
-        )
-    try:
-        ids = await _post_series_metathreads(mt_client, posts, login)
-        logger.info(f"[{login}] ✓ Опубликовано через metathreads")
-        return ids
-    except Exception as e:
-        logger.error(f"[{login}] metathreads тоже упал: {e}")
-        raise Exception(
-            f"Не удалось опубликовать ни через одну библиотеку.\n"
-            f"Danie1: нет токена или ошибка.\n"
-            f"metathreads: {e}"
-        )
-
-
-async def _post_series_danie1(api, posts: dict, image_path: str, login: str) -> list:
-    """Публикация через Danie1/threads-api с поддержкой картинки и reply_to."""
-    img = image_path if (image_path and os.path.exists(image_path)) else None
     ids = []
 
-    ok1 = await api.post(caption=posts['post1'])
-    if not ok1:
-        raise Exception("post1 вернул False")
-    ids.append('d1')
-    await asyncio.sleep(random.uniform(8, 14))
-
-    await api.post(caption=posts['post2'])
-    ids.append('d2')
-    await asyncio.sleep(random.uniform(8, 14))
-
-    await api.post(caption=posts['post3'], image_path=img)
-    ids.append('d3')
-    await asyncio.sleep(random.uniform(8, 14))
-
-    await api.post(caption=posts['post4'])
-    ids.append('d4')
-
-    return ids
-
-
-async def _post_series_metathreads(client, posts: dict, login: str) -> list:
-    """Публикация через metathreads с reply_to (без картинки)."""
-    ids = []
-
-    r1  = await asyncio.to_thread(_post_with_reply_metathreads, client, posts['post1'])
+    # — Пост 1 ─────────────────────────────────────────────────────────────────
+    r1  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post1'])
     id1 = _pk(r1); ids.append(id1)
     logger.info(f"[{login}] Пост 1: {id1}")
     await asyncio.sleep(random.uniform(8, 14))
 
-    r2  = await asyncio.to_thread(_post_with_reply_metathreads, client, posts['post2'], id1)
+    # — Пост 2 ─────────────────────────────────────────────────────────────────
+    r2  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post2'], id1)
     id2 = _pk(r2); ids.append(id2)
     logger.info(f"[{login}] Пост 2: {id2}")
     await asyncio.sleep(random.uniform(8, 14))
 
-    r3  = await asyncio.to_thread(_post_with_reply_metathreads, client, posts['post3'], id2)
-    id3 = _pk(r3); ids.append(id3)
-    logger.info(f"[{login}] Пост 3: {id3}")
+    # — Пост 3 (с картинкой) ───────────────────────────────────────────────────
+    img = image_path if (image_path and os.path.exists(image_path)) else None
+    id3 = ''
+    if img and ig_client:
+        try:
+            id3 = await asyncio.to_thread(
+                _post_image_to_threads, ig_client, posts['post3'], img, id2
+            )
+            logger.info(f"[{login}] Пост 3 (image): {id3}")
+        except Exception as e:
+            logger.warning(f"[{login}] Image posting упал ({e}), публикую текст...")
+            id3 = ''
+
+    if not id3:
+        r3  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post3'], id2)
+        id3 = _pk(r3)
+        logger.info(f"[{login}] Пост 3 (текст): {id3}")
+
+    ids.append(id3)
     await asyncio.sleep(random.uniform(8, 14))
 
-    r4  = await asyncio.to_thread(_post_with_reply_metathreads, client, posts['post4'], id3)
+    # — Пост 4 ─────────────────────────────────────────────────────────────────
+    r4  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post4'], id3)
     id4 = _pk(r4); ids.append(id4)
     logger.info(f"[{login}] Пост 4: {id4}")
 
+    logger.info(f"[{login}] ✓ Серия опубликована: {ids}")
     return ids
 
 
 def post_series(posts: dict, image_path: str = None,
                 account_login: str = None) -> list:
-    """Синхронная обёртка."""
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(
-            post_series_async(posts, image_path, account_login)
-        )
+        return loop.run_until_complete(post_series_async(posts, image_path, account_login))
     finally:
         loop.close()
 
 
 # ══════════════════════════════════════════════════════════════
-#  ПРОЧИЕ ДЕЙСТВИЯ — AUTO-FALLBACK НА КАЖДОМ МЕТОДЕ
+#  ПРОЧИЕ ДЕЙСТВИЯ — METATHREADS + FALLBACK
 # ══════════════════════════════════════════════════════════════
 
-def _with_fallback(login: str, mt_fn, d1_fn=None, fn_name: str = ''):
-    """
-    Универсальный враппер с авто-фоллбэком.
-    Сначала пробует metathreads, при ошибке — Danie1 (если d1_fn задан).
-    Для аккаунтов только Danie1 (client is None) сразу идём в Danie1.
-    """
+def _mt(login: str, fn, fn_name: str = ''):
+    """Вызов metathreads с активацией сессии нужного аккаунта."""
     entry = get_client(login)
-    mt_client = entry['client']
-
-    # Попытка 1: metathreads (если есть клиент)
-    if mt_client is not None:
-        try:
-            _activate_client(mt_client)
-            return mt_fn(mt_client)
-        except Exception as e:
-            logger.warning(f"{fn_name}({login}) metathreads: {e}")
-
-    # Попытка 2: Danie1
-    if d1_fn:
-        api = _get_danie1_client(login)
-        if api:
-            try:
-                return d1_fn(api)
-            except Exception as e2:
-                logger.warning(f"{fn_name}({login}) Danie1: {e2}")
-
-    return None  # обе библиотеки не сработали
+    mt    = entry['client']
+    if not mt:
+        logger.warning(f"{fn_name}({login}): нет metathreads-клиента")
+        return None
+    try:
+        _activate_client(mt)
+        return fn(mt)
+    except Exception as e:
+        logger.warning(f"{fn_name}({login}): {e}")
+        return None
 
 
 def get_thread_replies(post_id: str, account_login: str = None) -> list:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: _parse_replies(c.get_thread_replies(post_id)),
-        fn_name= 'get_thread_replies',
-    )
-    return result if result is not None else []
+    r = _mt(account_login, lambda c: _parse_replies(c.get_thread_replies(post_id)),
+            'get_thread_replies')
+    return r or []
 
 
 def like_thread(post_id: str, account_login: str = None) -> bool:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: (c.like_thread(post_id), True)[1],
-        d1_fn  = lambda api: asyncio.get_event_loop().run_until_complete(
-                     _danie1_like(api, post_id)),
-        fn_name= 'like_thread',
-    )
-    return bool(result)
+    r = _mt(account_login, lambda c: (c.like_thread(post_id), True)[1], 'like_thread')
+    return bool(r)
 
 
 def repost_thread(post_id: str, account_login: str = None) -> bool:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: (c.repost_thread(post_id), True)[1],
-        fn_name= 'repost_thread',
-    )
-    return bool(result)
+    r = _mt(account_login, lambda c: (c.repost_thread(post_id), True)[1], 'repost_thread')
+    return bool(r)
 
 
 def follow_user(user_id: str, account_login: str = None) -> bool:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: (c.follow(user_id), True)[1],
-        d1_fn  = lambda api: asyncio.get_event_loop().run_until_complete(
-                     _danie1_follow(api, user_id)),
-        fn_name= 'follow_user',
-    )
-    return bool(result)
+    r = _mt(account_login, lambda c: (c.follow(user_id), True)[1], 'follow_user')
+    return bool(r)
 
 
 def search_users(query: str, account_login: str = None) -> list:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: _parse_users(c.search_user(query)),
-        fn_name= 'search_users',
-    )
-    return result if result is not None else []
+    r = _mt(account_login, lambda c: _parse_users(c.search_user(query)), 'search_users')
+    return r or []
 
 
 def get_user_threads(user_id: str, account_login: str = None) -> list:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: _parse_threads(c.get_user_threads(user_id)),
-        d1_fn  = lambda api: asyncio.get_event_loop().run_until_complete(
-                     _danie1_get_threads(api, user_id)),
-        fn_name= 'get_user_threads',
-    )
-    return result if result is not None else []
+    r = _mt(account_login, lambda c: _parse_threads(c.get_user_threads(user_id)),
+            'get_user_threads')
+    return r or []
 
 
 def get_thread_stats(post_id: str, account_login: str = None) -> dict:
-    result = _with_fallback(
-        account_login,
-        mt_fn  = lambda c: _parse_stats(c.get_thread(post_id)),
-        d1_fn  = lambda api: asyncio.get_event_loop().run_until_complete(
-                     _danie1_get_stats(api, post_id)),
-        fn_name= 'get_thread_stats',
-    )
-    return result if result is not None else {}
-
-
-# ── Danie1 async helpers (запускаются из синхронного контекста) ──
-
-async def _danie1_like(api, post_id: str) -> bool:
-    """Лайк через Danie1 — библиотека не имеет like, используем get_post_likes как проверку."""
-    # Danie1 не имеет метода like — возвращаем False чтобы не крашить
-    return False
-
-
-async def _danie1_follow(api, user_id: str) -> bool:
-    try:
-        return await api.follow_user(user_id)
-    except Exception:
-        return False
-
-
-async def _danie1_get_threads(api, user_id: str) -> list:
-    try:
-        result = await api.get_user_threads(user_id)
-        if not result:
-            return []
-        # Danie1 возвращает список thread-объектов
-        posts = []
-        for t in (result if isinstance(result, list) else []):
-            if isinstance(t, dict):
-                items = t.get('thread_items', [])
-                for item in (items or []):
-                    post = item.get('post', item) if isinstance(item, dict) else item
-                    if post: posts.append(post)
-        return posts
-    except Exception:
-        return []
-
-
-async def _danie1_get_stats(api, post_id: str) -> dict:
-    try:
-        result = await api.get_post(post_id)
-        if not result:
-            return {}
-        # Danie1 get_post возвращает структуру с thread_items
-        items = result.get('containing_thread', {}).get('thread_items', []) if isinstance(result, dict) else []
-        if items and isinstance(items[0], dict):
-            post = items[0].get('post', items[0])
-            if isinstance(post, dict):
-                return {
-                    'likes':   post.get('like_count', 0),
-                    'replies': post.get('reply_count', 0),
-                    'reposts': post.get('repost_count', 0),
-                }
-        return {}
-    except Exception:
-        return {}
+    r = _mt(account_login, lambda c: _parse_stats(c.get_thread(post_id)), 'get_thread_stats')
+    return r or {}

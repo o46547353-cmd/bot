@@ -337,11 +337,11 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data['_conv_state']         = 'refresh_token'
         ctx.user_data['refresh_token_login'] = login
         await q.edit_message_text(
-            f"🔄 *Обновление токена для @{acc.get('username', login)}*\n\n"
+            f"🔄 *Обновление сессии для @{acc.get('username', login)}*\n\n"
             f"Отправь пароль от Instagram-аккаунта `{login}`.\n\n"
-            f"Бот залогинится через Danie1 и обновит Bearer-токен — "
-            f"после этого все функции (лайки, прогрев, репосты) снова заработают.\n\n"
-            f"⚠️ Пароль нигде не сохраняется — используется только для получения токена.\n\n"
+            f"Бот перелогинится через instagrapi — "
+            f"все функции (лайки, прогрев, репосты, картинки) снова заработают.\n\n"
+            f"⚠️ Пароль нигде не сохраняется — используется только для получения сессии.\n\n"
             f"/cancel — отмена",
             parse_mode='Markdown'
         )
@@ -515,36 +515,73 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['pending_login']    = login
     ctx.user_data['pending_password'] = password
     msg = await upd.message.reply_text(
-        f"⏳ Авторизую *{login}*...\n\n"
-        f"_Сначала пробую Bloks API, если не ответит — Danie1_",
+        f"⏳ *Шаг 1/2* — Bloks API...\n`{login}`",
         parse_mode='Markdown'
     )
+
+    # Таймер который обновляет сообщение пока идёт авторизация
+    async def _status_updater():
+        steps = [
+            (22, "⏳ *Шаг 1/2* — Bloks не отвечает, пробую Danie1...\n`{login}`"),
+            (45, "⏳ *Шаг 2/2* — Danie1 авторизует...\n`{login}` _(может занять до 40с)_"),
+            (80, "⏳ Почти готово, Instagram медленно отвечает...\n`{login}`"),
+        ]
+        for delay, text in steps:
+            await asyncio.sleep(delay)
+            try:
+                await msg.edit_text(text.format(login=login), parse_mode='Markdown')
+            except Exception:
+                pass
+
+    updater_task = asyncio.ensure_future(_status_updater())
+
     try:
-        result = await asyncio.to_thread(threads_api.add_account, login, password)
-        # Фоново получаем Danie1 token если ещё нет (для image-постинга)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(threads_api.add_account, login, password),
+            timeout=120  # максимум 2 минуты на всю цепочку
+        )
+        updater_task.cancel()
         asyncio.ensure_future(_try_danie1_login_bg(login, password))
         await msg.edit_text(
-            f"✅ Аккаунт *@{result.get('username', login)}* добавлен!\n"
+            f"✅ *@{result.get('username', login)}* добавлен!\n"
             f"⏳ Получаю Bearer-токен для image-постинга...",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")]])
         )
         return ConversationHandler.END
-    except TwoFactorRequired as e:
+
+    except asyncio.TimeoutError:
+        updater_task.cancel()
+        await msg.edit_text(
+            f"❌ *Instagram не отвечает уже 2 минуты*\n\n"
+            f"Аккаунт `{login}` заблокирован для входа по логину/паролю.\n\n"
+            f"*Единственное решение — /manual\\_cookies:*\n"
+            f"F12 → Application → Cookies → threads.net\n"
+            f"Скопируй `sessionid` и `csrftoken`",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🍪 Инструкция cookies", callback_data="acc:add_info")
+            ]])
+        )
+        return ConversationHandler.END
+
+    except TwoFactorRequired:
+        updater_task.cancel()
         ctx.user_data['2fa_login'] = login
-        # Определяем откуда пришёл 2FA запрос
         pending = threads_api._pending_2fa.get(login, {})
         method  = pending.get('method', 'bloks')
         source  = "Danie1" if method == 'danie1' else "Instagram Bloks"
         await msg.edit_text(
             f"🔐 *Двухфакторная аутентификация*\n\n"
-            f"Аккаунт: *{login}*\n"
-            f"Источник запроса: _{source}_\n\n"
-            f"Введи 6-значный код из приложения-аутентификатора (Google Authenticator, Authy и т.п.):",
+            f"Аккаунт: `{login}`\n"
+            f"Источник: _{source}_\n\n"
+            f"Введи 6-значный код из Google Authenticator / Authy:",
             parse_mode='Markdown'
         )
         return WAIT_2FA
+
     except Exception as e:
+        updater_task.cancel()
         await msg.edit_text(
             f"❌ *Не удалось добавить аккаунт*\n\n{e}",
             parse_mode='Markdown',
@@ -997,7 +1034,7 @@ async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE)
         uname = acc.get('username', login) if acc else login
         await upd.message.reply_text(f"⏳ Обновляю токен для *@{uname}*...", parse_mode='Markdown')
         try:
-            ok = await threads_api.login_danie1(login, password)
+            ok = await threads_api.refresh_token(login, password)
             if ok:
                 # Проверяем hybrid-статус
                 try:

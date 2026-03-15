@@ -1,7 +1,7 @@
 # Telegram
 python-telegram-bot[job-queue]==21.10
 
-# Scheduler [BUG-11 FIX: was missing entirely]
+# Scheduler
 apscheduler>=3.10.0
 
 # HTTP — совместимые версии для PTB + metathreads
@@ -9,11 +9,14 @@ httpx>=0.27,<0.29
 h11>=0.14.0
 httpcore>=1.0.0,<2.0.0
 
-# Second Threads library: Danie1/threads-api [BUG-12 FIX]
-threads-api==1.1.1
+# Threads API (metathreads — лайки, фолловы, реплаи, поиск, статистика)
+metathreads
 
-# aiohttp (required by threads-api) [BUG-13 FIX]
-aiohttp>=3.8.0
+# Instagram auth + image posting (заменяет Danie1/threads-api)
+instagrapi>=2.1.2
+
+# TOTP — автогенерация 2FA кодов из Google Authenticator seed
+pyotp>=2.9.0
 
 # AI
 openai>=1.50.0
@@ -24,6 +27,6 @@ requests
 cryptography
 pytz
 
-# metathreads dependencies (ставим сами чтобы не было конфликтов)
+# metathreads dependencies
 beautifulsoup4
 lxml
