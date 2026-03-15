@@ -118,7 +118,20 @@ CREATE INDEX IF NOT EXISTS idx_queue_login ON posts_queue(account_login);
         conn.commit()
 
 
+def _migrate_accounts_add_auth_type():
+    """Добавить колонку auth_type, если её нет (миграция для старых БД)."""
+    with _lock:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute('PRAGMA table_info(accounts)')
+        columns = [row[1] for row in c.fetchall()]
+        if 'auth_type' not in columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN auth_type TEXT DEFAULT 'cookie'")
+            conn.commit()
+
+
 _init_db()
+_migrate_accounts_add_auth_type()
 
 
 # --- Аккаунты ---
