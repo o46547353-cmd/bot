@@ -1,154 +1,34 @@
-### threads_api.py — instagrapi auth + metathreads operations
+### threads_api.py — v2: SlashThreadsClient (заменяет metathreads)
 #
 # Auth: instagrapi (sessionid, password+2FA, TOTP, session file)
-# Threads operations: metathreads (like, follow, search, repost, replies, stats)
-# Image posting: instagrapi private API → Threads configure endpoint
+# Threads operations: SlashThreadsClient (like, follow, search, repost, replies, stats, post)
+# Image posting: SlashThreadsClient.post_image_thread (через rupload → configure)
 #
-# AUTH_TYPE_INSTAGRAPI — новый тип (заменяет danie1)
-# AUTH_TYPE_COOKIE     — ручной ввод cookies (manual_cookies)
-# AUTH_TYPE_BLOKS      — legacy metathreads bloks (fallback)
+# ИЗМЕНЕНИЯ v2:
+#   - metathreads полностью удалён
+#   - все операции через SlashThreadsClient (slash_threads_client.py)
+#   - _post_with_reply_metathreads → client.post_thread()
+#   - _post_image_to_threads → client.post_image_thread()
+#   - _ig_post_text удалён (дублировал post_thread)
+#   - парсинг ответов перенесён в SlashThreadsClient
 
-import os, time, random, logging, datetime, json, asyncio
+import os, time, random, logging, asyncio, json
 from dotenv import load_dotenv
 import storage
 import threads_auth
 from threads_auth import TwoFactorRequired, LoginFailed
+from slash_threads_client import SlashThreadsClient
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 AUTH_TYPE_INSTAGRAPI = 'instagrapi'
 AUTH_TYPE_COOKIE     = 'cookie'
-AUTH_TYPE_BLOKS      = 'bloks'
 
-# login → { client, ig_client, username, user_id, login }
+# login → { client: SlashThreadsClient, ig_client, username, user_id, login }
 _clients: dict     = {}
 # login → { login, password, ig_client } — ожидание кода 2FA
 _pending_2fa: dict = {}
-
-
-# ══════════════════════════════════════════════════════════════
-#  METATHREADS — ВСПОМОГАТЕЛЬНЫЕ
-# ══════════════════════════════════════════════════════════════
-
-def _activate_client(mt_client):
-    try:
-        from metathreads import config
-        config._DEFAULT_SESSION = mt_client.session
-    except Exception:
-        pass
-
-
-def _parse_users(resp) -> list:
-    if not resp: return []
-    if isinstance(resp, list): return resp
-    if isinstance(resp, dict):
-        u = resp.get('users', [])
-        if isinstance(u, list): return u
-    return []
-
-
-def _parse_threads(resp) -> list:
-    if not resp: return []
-    if isinstance(resp, list): return resp
-    posts = []
-    if isinstance(resp, dict):
-        for t in (resp.get('threads', []) or []):
-            if not isinstance(t, dict): continue
-            for item in (t.get('thread_items', []) or []):
-                post = item.get('post', item) if isinstance(item, dict) else item
-                if post: posts.append(post)
-    return posts
-
-
-def _parse_replies(resp) -> list:
-    if not resp: return []
-    if isinstance(resp, list): return resp
-    posts = []
-    if isinstance(resp, dict):
-        for key in ('reply_threads', 'containing_thread', 'threads'):
-            bucket = resp.get(key, [])
-            if isinstance(bucket, dict): bucket = [bucket]
-            for t in (bucket or []):
-                if not isinstance(t, dict): continue
-                for item in (t.get('thread_items', []) or []):
-                    post = item.get('post', item) if isinstance(item, dict) else item
-                    if post: posts.append(post)
-        if not posts:
-            for val in resp.values():
-                if isinstance(val, list) and val:
-                    posts = val; break
-    return posts
-
-
-def _parse_stats(resp) -> dict:
-    if not resp or not isinstance(resp, dict): return {}
-    ct = resp.get('containing_thread', {})
-    if isinstance(ct, dict):
-        items = ct.get('thread_items', [])
-        if items and isinstance(items[0], dict):
-            post = items[0].get('post', items[0])
-            if isinstance(post, dict):
-                return {
-                    'likes':   post.get('like_count', 0),
-                    'replies': (post.get('reply_count', 0)
-                                or post.get('text_post_app_info', {}).get('reply_count', 0)),
-                    'reposts': post.get('repost_count', 0),
-                }
-    return {
-        'likes':   resp.get('like_count', 0),
-        'replies': resp.get('reply_count', 0),
-        'reposts': resp.get('repost_count', 0),
-    }
-
-
-def _pk(resp) -> str:
-    if resp is None: return ''
-    if isinstance(resp, bool): return ''
-    if isinstance(resp, dict):
-        pk = (resp.get('media', {}) or {}).get('pk')
-        if pk: return str(pk)
-        pk = resp.get('pk')
-        if pk: return str(pk)
-    return str(resp) if resp else ''
-
-
-# ══════════════════════════════════════════════════════════════
-#  METATHREADS — СОЗДАНИЕ КЛИЕНТА
-# ══════════════════════════════════════════════════════════════
-
-def _make_metathreads_client(session_id: str, csrf_token: str,
-                              user_id: str, username: str,
-                              auth_type: str = 'cookie'):
-    from metathreads import MetaThreads
-    cl = MetaThreads()
-    if auth_type == AUTH_TYPE_BLOKS:
-        if session_id: cl.session.headers.update({'Authorization': session_id})
-        if csrf_token: cl.session.headers.update({'X-Mid': csrf_token})
-    else:
-        cl.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
-    cl.logged_in_user = {'pk': user_id, 'username': username}
-    return cl
-
-
-def _make_metathreads_from_token(bearer_token: str, user_id: str, username: str):
-    """Создаём metathreads-клиент из Bearer-токена (instagrapi или Bloks)."""
-    from metathreads import MetaThreads
-    cl = MetaThreads()
-    if bearer_token:
-        cl.session.headers.update({'Authorization': bearer_token})
-    cl.logged_in_user = {'pk': user_id, 'username': username}
-    return cl
-
-
-def _make_metathreads_from_sessionid(sessionid: str, csrftoken: str,
-                                      user_id: str, username: str):
-    """Создаём metathreads-клиент из sessionid cookie."""
-    from metathreads import MetaThreads
-    cl = MetaThreads()
-    cl.session.cookies.update({'sessionid': sessionid, 'csrftoken': csrftoken})
-    cl.logged_in_user = {'pk': user_id, 'username': username}
-    return cl
 
 
 # ══════════════════════════════════════════════════════════════
@@ -158,15 +38,13 @@ def _make_metathreads_from_sessionid(sessionid: str, csrftoken: str,
 def _get_ig_client(login: str):
     """
     Возвращает живой instagrapi Client для аккаунта.
-    Сначала смотрим в памяти (_clients[login]['ig_client']),
-    потом пробуем восстановить из session-файла.
+    Нужен ТОЛЬКО для device IDs при создании SlashThreadsClient.
     """
     entry = _clients.get(login, {})
     ig = entry.get('ig_client')
     if ig:
         return ig
 
-    # Пробуем восстановить из session-файла
     session_file = threads_auth._session_path(login)
     if not os.path.exists(session_file):
         return None
@@ -176,7 +54,6 @@ def _get_ig_client(login: str):
         cl = Client()
         cl.delay_range = [1, 3]
         cl.set_settings(cl.load_settings(session_file))
-        # Обновляем в памяти
         if login in _clients:
             _clients[login]['ig_client'] = cl
         logger.info(f"[{login}] instagrapi восстановлен из session-файла ✓")
@@ -187,141 +64,23 @@ def _get_ig_client(login: str):
 
 
 # ══════════════════════════════════════════════════════════════
-#  IMAGE POSTING — instagrapi private API → Threads endpoint
+#  СОЗДАНИЕ SlashThreadsClient
 # ══════════════════════════════════════════════════════════════
 
-def _post_image_to_threads(ig_cl, caption: str, image_path: str,
-                            reply_to: str = None) -> str:
-    """
-    Публикует тред с изображением через instagrapi private session.
-    Использует Instagram rupload endpoint + Threads configure endpoint.
-    Возвращает media_pk (строка) или '' при ошибке.
-    """
-    upload_id = str(int(time.time() * 1000))
-
-    # Step 1: загружаем фото
-    with open(image_path, 'rb') as f:
-        photo_data = f.read()
-
-    rupload_params = json.dumps({
-        'upload_id': upload_id,
-        'media_type': 1,
-        'retry_context': json.dumps({
-            'num_reupload': 0, 'num_step_auto_retry': 0, 'num_step_manual_retry': 0
-        }),
-    })
-
-    r = ig_cl.private.post(
-        f'https://i.instagram.com/rupload_igphoto/{upload_id}',
-        data=photo_data,
-        headers={
-            'X-Entity-Type': 'image/jpeg',
-            'Offset': '0',
-            'X-Instagram-Rupload-Params': rupload_params,
-            'X-Entity-Name': f'fb_uploader_{upload_id}',
-            'X-Entity-Length': str(len(photo_data)),
-            'Content-Type': 'application/octet-stream',
-        }
-    )
-    r.raise_for_status()
-    logger.debug(f"Photo uploaded: {r.json()}")
-
-    # Step 2: конфигурируем как Threads пост
-    text_post_info: dict = {'reply_control': 0}
-    if reply_to:
-        text_post_info['reply_id'] = str(reply_to)
-
-    data = {
-        'caption':           caption,
-        'upload_id':         upload_id,
-        'publish_mode':      'media_post',
-        'text_post_app_info': json.dumps(text_post_info),
-        'timezone_offset':   '0',
-        'audience':          'default',
-        '_uid':              str(ig_cl.user_id),
-        '_uuid':             ig_cl.uuid,
-        'device_id':         ig_cl.android_id,
-    }
-    signed = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
-
-    r2 = ig_cl.private.post(
-        'https://www.threads.net/api/v1/media/configure_text_post_app_feed/',
-        data=signed,
-    )
-    r2.raise_for_status()
-    result = r2.json()
-    return str((result.get('media') or {}).get('pk', ''))
+def _make_client_from_ig(ig_client, user_id: str, username: str) -> SlashThreadsClient:
+    """Создать SlashThreadsClient из instagrapi Client (Bearer + cookies + device IDs)."""
+    return SlashThreadsClient.from_instagrapi(ig_client, user_id, username)
 
 
-def _ig_post_text(ig_cl, caption: str, reply_to: str = None) -> str:
-    """Текстовый пост в Threads через instagrapi private API (fallback когда metathreads недоступен)."""
-    text_post_info: dict = {'reply_control': 0}
-    if reply_to:
-        text_post_info['reply_id'] = str(reply_to)
-
-    upload_id = str(int(time.time() * 1000))
-    data = {
-        'publish_mode':       'text_post',
-        'upload_id':          upload_id,
-        'text_post_app_info': json.dumps(text_post_info),
-        'timezone_offset':    '0',
-        'caption':            caption,
-        'audience':           'default',
-        '_uid':               str(ig_cl.user_id),
-        '_uuid':              ig_cl.uuid,
-        'device_id':          ig_cl.android_id,
-    }
-    signed = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
-    r = ig_cl.private.post(
-        'https://www.threads.net/api/v1/media/configure_text_post_app_feed/',
-        data=signed,
-    )
-    r.raise_for_status()
-    result = r.json()
-    return str((result.get('media') or {}).get('pk', ''))
+def _make_client_from_session(sessionid: str, csrftoken: str,
+                               user_id: str, username: str) -> SlashThreadsClient:
+    """Создать SlashThreadsClient из sessionid cookie."""
+    return SlashThreadsClient.from_session(sessionid, csrftoken, user_id, username)
 
 
-
-# ══════════════════════════════════════════════════════════════
-#  METATHREADS — ПУБЛИКАЦИЯ С REPLY_TO (текст)
-# ══════════════════════════════════════════════════════════════
-
-def _post_with_reply_metathreads(client, caption: str, reply_to: str = None) -> dict:
-    from metathreads.constants import Path
-    from metathreads.request_util import generate_request_data
-
-    # user_id берём из logged_in_user — у MetaThreads нет прямого атрибута user_id
-    user = client.logged_in_user or {}
-    uid  = str(user.get('pk') or user.get('id') or '')
-
-    # Setting.ANDROID_ID/DEVICE_ID могут отсутствовать в старых версиях metathreads
-    try:
-        from metathreads.constants import Setting
-        android_id = getattr(Setting, 'ANDROID_ID', 'android-' + uid[:8])
-        device_uuid = getattr(Setting, 'DEVICE_ID', uid or 'device-uuid')
-    except Exception:
-        android_id  = 'android-' + uid[:8]
-        device_uuid = uid or 'device-uuid'
-
-    upload_id = int(datetime.datetime.now().timestamp() * 1000) % (10 ** 9)
-    text_post_info: dict = {'reply_control': 0}
-    if reply_to:
-        text_post_info['reply_id'] = str(reply_to)
-
-    data = {
-        'publish_mode':      'text_post',
-        'upload_id':         upload_id,
-        'text_post_app_info': text_post_info,
-        'timezone_offset':   0,
-        '_uid':              uid,
-        'device_id':         android_id,
-        '_uuid':             device_uuid,
-        'caption':           caption,
-        'audience':          'default',
-    }
-    signed_data = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
-    _activate_client(client)
-    return generate_request_data(Path.POST_THREAD, data=signed_data, method='POST')
+def _make_client_from_bearer(bearer: str, user_id: str, username: str) -> SlashThreadsClient:
+    """Создать SlashThreadsClient из Bearer токена."""
+    return SlashThreadsClient.from_bearer(bearer, user_id, username)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -338,8 +97,8 @@ def load_accounts_from_db():
         user_id  = acc.get('user_id', login)
         auth     = acc.get('auth_type', AUTH_TYPE_COOKIE)
 
-        mt_client = None
-        ig_client  = None
+        client    = None
+        ig_client = None
 
         # Восстанавливаем instagrapi из session-файла
         session_file = threads_auth._session_path(login)
@@ -354,33 +113,31 @@ def load_accounts_from_db():
             except Exception as e:
                 logger.warning(f"[{login}] instagrapi session: {e}")
 
-        # Строим metathreads-клиент
+        # Строим SlashThreadsClient
         try:
-            sid = acc.get('session_id', '')
-            csrf = acc.get('csrf_token', '')
-
             if auth == AUTH_TYPE_INSTAGRAPI and ig_client:
-                # Из Bearer-токена instagrapi
-                bearer = threads_auth._extract_bearer(ig_client)
-                mt_client = _make_metathreads_from_token(bearer, user_id, username)
-            elif auth == AUTH_TYPE_BLOKS and sid:
-                mt_client = _make_metathreads_client(sid, csrf, user_id, username, AUTH_TYPE_BLOKS)
-            elif sid:
-                mt_client = _make_metathreads_client(sid, csrf, user_id, username, AUTH_TYPE_COOKIE)
+                client = _make_client_from_ig(ig_client, user_id, username)
+                logger.info(f"[{login}] SlashThreadsClient via instagrapi ✓")
+            else:
+                sid  = acc.get('session_id', '')
+                csrf = acc.get('csrf_token', '')
+                if sid:
+                    client = _make_client_from_session(sid, csrf, user_id, username)
+                    logger.info(f"[{login}] SlashThreadsClient via cookie ✓")
         except Exception as e:
-            logger.warning(f"[{login}] metathreads клиент: {e}")
+            logger.warning(f"[{login}] SlashThreadsClient: {e}")
 
         _clients[login] = {
-            'client':    mt_client,
+            'client':    client,
             'ig_client': ig_client,
             'username':  username,
             'user_id':   user_id,
             'login':     login,
         }
 
-        has_mt = mt_client is not None
+        has_cl = client is not None
         has_ig = ig_client is not None
-        mode = 'full' if (has_mt and has_ig) else ('mt-only' if has_mt else ('ig-only' if has_ig else 'empty'))
+        mode = 'full' if (has_cl and has_ig) else ('cl-only' if has_cl else ('ig-only' if has_ig else 'empty'))
         logger.info(f"Загружен [{mode}]: {login}")
 
     logger.info(f"Загружено аккаунтов: {len(_clients)}")
@@ -393,7 +150,7 @@ def load_accounts_from_db():
 def add_account(login: str, password: str) -> dict:
     """
     Логин через instagrapi.
-    При 2FA — raise TwoFactorRequired (pending_2fa сохраняет password + ig_client).
+    При 2FA — raise TwoFactorRequired.
     """
     logger.info(f"[{login}] Логин через instagrapi...")
     try:
@@ -412,7 +169,7 @@ def add_account(login: str, password: str) -> dict:
 
 
 def confirm_2fa(login: str, code: str) -> dict:
-    """Завершение 2FA. Восстанавливает pending из памяти или предлагает повтор."""
+    """Завершение 2FA."""
     if login not in _pending_2fa:
         saved = storage.get_pending_2fa(login)
         if saved:
@@ -420,7 +177,7 @@ def confirm_2fa(login: str, code: str) -> dict:
             _pending_2fa[login] = {
                 'login':     saved['login'],
                 'password':  saved['password'],
-                'ig_client': None,  # потерян при рестарте
+                'ig_client': None,
             }
         else:
             raise Exception(
@@ -434,7 +191,6 @@ def confirm_2fa(login: str, code: str) -> dict:
     ig_client = pending.get('ig_client')
 
     if not ig_client:
-        # Рестарт бота — нужен новый логин чтобы получить свежую 2FA сессию
         _pending_2fa.pop(login, None)
         storage.delete_pending_2fa(login)
         raise Exception(
@@ -455,9 +211,9 @@ def add_account_manual(login: str, session_id: str, csrf_token: str) -> dict:
     """Добавление через sessionid из браузера."""
     user_id  = ''
     username = login
-
-    # Сначала пробуем instagrapi login_by_sessionid
     ig_client = None
+
+    # Пробуем instagrapi login_by_sessionid
     try:
         result = threads_auth.login_by_sessionid(login, session_id, csrf_token)
         user_id   = result.get('user_id', '')
@@ -466,28 +222,30 @@ def add_account_manual(login: str, session_id: str, csrf_token: str) -> dict:
     except Exception as e:
         logger.warning(f"[{login}] instagrapi by sessionid: {e}")
 
-    # Fallback: metathreads для получения user_id/username
+    # Создаём наш клиент из cookies
+    client = _make_client_from_session(session_id, csrf_token, user_id, username)
+
+    # Пробуем получить user_id/username через наш клиент
     if not user_id:
         try:
-            from metathreads import MetaThreads
-            tmp = MetaThreads()
-            tmp.session.cookies.update({'sessionid': session_id, 'csrftoken': csrf_token})
-            _activate_client(tmp)
-            resolved = tmp.get_user_id(login)
+            resolved = client.get_user_id(login)
             if resolved:
-                user_id = str(resolved)
-            user_data = tmp.get_user(login)
-            if isinstance(user_data, list) and user_data:
-                user_data = user_data[0]
-            if isinstance(user_data, dict):
-                u = (user_data.get('data', {}) or {}).get('user', {}) or user_data
-                username = u.get('username', login)
+                user_id = resolved
+                client.user_id = user_id
         except Exception as e:
-            logger.warning(f"[{login}] metathreads profile: {e}")
+            logger.warning(f"[{login}] get_user_id: {e}")
 
-    mt_client = _make_metathreads_client(session_id, csrf_token, user_id, username)
+    if username == login:
+        try:
+            info = client.get_user_info(login)
+            if info.get('username'):
+                username = info['username']
+                client.username = username
+        except Exception:
+            pass
+
     _clients[login] = {
-        'client':    mt_client,
+        'client':    client,
         'ig_client': ig_client,
         'username':  username,
         'user_id':   user_id,
@@ -512,25 +270,26 @@ def _save_from_instagrapi_result(login: str, password: str, result: dict) -> dic
     username  = result.get('username', login)
     sessionid = result.get('sessionid', '')
     csrftoken = result.get('csrftoken', '')
-    bearer    = result.get('auth_token', '')
 
-    # metathreads: сначала Bearer, fallback на sessionid cookie
-    mt_client = None
-    if bearer:
+    # Создаём SlashThreadsClient из instagrapi (самый надёжный способ)
+    client = None
+    if ig_client:
         try:
-            mt_client = _make_metathreads_from_token(bearer, user_id, username)
-            logger.info(f"[{login}] metathreads via Bearer ✓")
+            client = _make_client_from_ig(ig_client, user_id, username)
+            logger.info(f"[{login}] SlashThreadsClient via instagrapi ✓")
         except Exception as e:
-            logger.warning(f"[{login}] metathreads Bearer: {e}")
-    if mt_client is None and sessionid:
+            logger.warning(f"[{login}] SlashThreadsClient from ig: {e}")
+
+    # Fallback: из sessionid
+    if client is None and sessionid:
         try:
-            mt_client = _make_metathreads_from_sessionid(sessionid, csrftoken, user_id, username)
-            logger.info(f"[{login}] metathreads via sessionid ✓")
+            client = _make_client_from_session(sessionid, csrftoken, user_id, username)
+            logger.info(f"[{login}] SlashThreadsClient via sessionid ✓")
         except Exception as e:
-            logger.warning(f"[{login}] metathreads sessionid: {e}")
+            logger.warning(f"[{login}] SlashThreadsClient from session: {e}")
 
     _clients[login] = {
-        'client':    mt_client,
+        'client':    client,
         'ig_client': ig_client,
         'username':  username,
         'user_id':   user_id,
@@ -549,7 +308,7 @@ def _save_from_instagrapi_result(login: str, password: str, result: dict) -> dic
 
 
 # ══════════════════════════════════════════════════════════════
-#  ОБНОВЛЕНИЕ ТОКЕНА (кнопка "🔄 Обновить токен")
+#  ОБНОВЛЕНИЕ ТОКЕНА
 # ══════════════════════════════════════════════════════════════
 
 async def refresh_token(login: str, password: str) -> bool:
@@ -590,17 +349,14 @@ def list_accounts() -> list:
 async def post_series_async(posts: dict, image_path: str = None,
                             account_login: str = None) -> list:
     """
-    Публикует 4 поста.
-    Приоритет: metathreads (reply_to цепочка) → fallback: instagrapi private API.
-    Картинка: instagrapi → fallback текст.
+    Публикует 4 поста цепочкой.
+    Всё через SlashThreadsClient — один метод, без fallback-дублирования.
     """
-    entry     = get_client(account_login)
-    login     = entry['login']
-    mt_client = entry['client']
-    ig_client = entry.get('ig_client') or _get_ig_client(login)
+    entry  = get_client(account_login)
+    login  = entry['login']
+    client = entry['client']  # SlashThreadsClient
 
-    # Нужен хотя бы один из клиентов
-    if not mt_client and not ig_client:
+    if not client:
         raise Exception(
             f"Аккаунт {login} не инициализирован.\n"
             "Используй /add_account или /manual_cookies."
@@ -610,56 +366,34 @@ async def post_series_async(posts: dict, image_path: str = None,
     img = image_path if (image_path and os.path.exists(image_path)) else None
 
     async def _post_text(caption: str, reply_to: str = None) -> str:
-        """Публикует текстовый пост: metathreads → fallback instagrapi."""
-        mt_err = ig_err = None
-        if mt_client:
-            try:
-                r = await asyncio.to_thread(
-                    _post_with_reply_metathreads, mt_client, caption, reply_to
-                )
-                pk = _pk(r)
-                if pk:
-                    return pk
-                logger.warning(f"[{login}] metathreads вернул пустой pk, r={r}")
-            except Exception as e:
-                mt_err = str(e)
-                logger.warning(f"[{login}] metathreads text post: {e}", exc_info=True)
-        # fallback: instagrapi
-        if ig_client:
-            try:
-                pk = await asyncio.to_thread(
-                    _ig_post_text, ig_client, caption, reply_to
-                )
-                if pk:
-                    return pk
-                logger.warning(f"[{login}] instagrapi вернул пустой pk")
-            except Exception as e:
-                ig_err = str(e)
-                logger.warning(f"[{login}] instagrapi text post: {e}", exc_info=True)
-        raise Exception(
-            f"Не удалось опубликовать пост (оба метода упали). "
-            f"metathreads: {mt_err}. instagrapi: {ig_err}"
-        )
+        pk = await asyncio.to_thread(client.post_thread, caption, reply_to)
+        if not pk:
+            raise Exception(f"post_thread вернул пустой pk")
+        return pk
+
+    async def _post_image(caption: str, img_path: str, reply_to: str = None) -> str:
+        pk = await asyncio.to_thread(client.post_image_thread, caption, img_path, reply_to)
+        return pk
 
     ids = []
 
+    # Пост 1 — хук
     id1 = await _post_text(posts['post1'])
     ids.append(id1)
     logger.info(f"[{login}] Пост 1: {id1}")
     await asyncio.sleep(random.uniform(8, 14))
 
+    # Пост 2 — боль
     id2 = await _post_text(posts['post2'], id1)
     ids.append(id2)
     logger.info(f"[{login}] Пост 2: {id2}")
     await asyncio.sleep(random.uniform(8, 14))
 
-    # Пост 3 — с картинкой если есть
+    # Пост 3 — решение (с картинкой если есть)
     id3 = ''
-    if img and ig_client:
+    if img:
         try:
-            id3 = await asyncio.to_thread(
-                _post_image_to_threads, ig_client, posts['post3'], img, id2
-            )
+            id3 = await _post_image(posts['post3'], img, id2)
             logger.info(f"[{login}] Пост 3 (image): {id3}")
         except Exception as e:
             logger.warning(f"[{login}] Image posting: {e}, публикую текст...")
@@ -669,6 +403,7 @@ async def post_series_async(posts: dict, image_path: str = None,
     ids.append(id3)
     await asyncio.sleep(random.uniform(8, 14))
 
+    # Пост 4 — дожим
     id4 = await _post_text(posts['post4'], id3)
     ids.append(id4)
     logger.info(f"[{login}] Пост 4: {id4}")
@@ -687,56 +422,69 @@ def post_series(posts: dict, image_path: str = None,
 
 
 # ══════════════════════════════════════════════════════════════
-#  ПРОЧИЕ ДЕЙСТВИЯ — METATHREADS + FALLBACK
+#  ПРОЧИЕ ДЕЙСТВИЯ — через SlashThreadsClient
 # ══════════════════════════════════════════════════════════════
 
-def _mt(login: str, fn, fn_name: str = ''):
-    """Вызов metathreads с активацией сессии нужного аккаунта."""
+def _cl(login: str) -> SlashThreadsClient:
+    """Получить SlashThreadsClient для аккаунта."""
     entry = get_client(login)
-    mt    = entry['client']
-    if not mt:
-        logger.warning(f"{fn_name}({login}): нет metathreads-клиента")
-        return None
-    try:
-        _activate_client(mt)
-        return fn(mt)
-    except Exception as e:
-        logger.warning(f"{fn_name}({login}): {e}")
-        return None
+    client = entry['client']
+    if not client:
+        raise Exception(f"Нет клиента для {login}")
+    return client
 
 
 def get_thread_replies(post_id: str, account_login: str = None) -> list:
-    r = _mt(account_login, lambda c: _parse_replies(c.get_thread_replies(post_id)),
-            'get_thread_replies')
-    return r or []
+    try:
+        return _cl(account_login).get_thread_replies(post_id)
+    except Exception as e:
+        logger.warning(f"get_thread_replies({post_id}): {e}")
+        return []
 
 
 def like_thread(post_id: str, account_login: str = None) -> bool:
-    r = _mt(account_login, lambda c: (c.like_thread(post_id), True)[1], 'like_thread')
-    return bool(r)
+    try:
+        return _cl(account_login).like(post_id)
+    except Exception as e:
+        logger.warning(f"like_thread({post_id}): {e}")
+        return False
 
 
 def repost_thread(post_id: str, account_login: str = None) -> bool:
-    r = _mt(account_login, lambda c: (c.repost_thread(post_id), True)[1], 'repost_thread')
-    return bool(r)
+    try:
+        return _cl(account_login).repost(post_id)
+    except Exception as e:
+        logger.warning(f"repost_thread({post_id}): {e}")
+        return False
 
 
 def follow_user(user_id: str, account_login: str = None) -> bool:
-    r = _mt(account_login, lambda c: (c.follow(user_id), True)[1], 'follow_user')
-    return bool(r)
+    try:
+        return _cl(account_login).follow(user_id)
+    except Exception as e:
+        logger.warning(f"follow_user({user_id}): {e}")
+        return False
 
 
 def search_users(query: str, account_login: str = None) -> list:
-    r = _mt(account_login, lambda c: _parse_users(c.search_user(query)), 'search_users')
-    return r or []
+    try:
+        return _cl(account_login).search_users(query)
+    except Exception as e:
+        logger.warning(f"search_users({query}): {e}")
+        return []
 
 
 def get_user_threads(user_id: str, account_login: str = None) -> list:
-    r = _mt(account_login, lambda c: _parse_threads(c.get_user_threads(user_id)),
-            'get_user_threads')
-    return r or []
+    try:
+        return _cl(account_login).get_user_threads(user_id)
+    except Exception as e:
+        logger.warning(f"get_user_threads({user_id}): {e}")
+        return []
 
 
 def get_thread_stats(post_id: str, account_login: str = None) -> dict:
-    r = _mt(account_login, lambda c: _parse_stats(c.get_thread(post_id)), 'get_thread_stats')
-    return r or {}
+    try:
+        return _cl(account_login).get_thread_stats(post_id)
+    except Exception as e:
+        logger.warning(f"get_thread_stats({post_id}): {e}")
+        return {}

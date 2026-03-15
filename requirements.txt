@@ -4,7 +4,7 @@ python-telegram-bot[job-queue]==21.10
 # Scheduler
 apscheduler>=3.10.0
 
-# Instagram auth + image posting (заменяет Danie1)
+# Instagram auth ONLY (login, 2FA, TOTP, session save/restore)
 instagrapi>=2.1.2
 
 # TOTP — автогенерация 2FA кодов
@@ -19,6 +19,6 @@ requests
 cryptography
 pytz
 
-# metathreads dependencies (ставятся ДО metathreads --no-deps в Dockerfile)
-beautifulsoup4
-lxml
+# ─── УДАЛЕНО ───
+# metathreads          — заменён на slash_threads_client.py
+# beautifulsoup4, lxml — были зависимостями metathreads
