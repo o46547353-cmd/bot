@@ -118,22 +118,54 @@ def login(username, password):
     except Exception:
         raise Exception(f"Сервер вернул не JSON: {r.status_code} {r.text[:200]}")
 
-    if r.status_code == 400:
-        msg   = data.get("message", "")
-        error = data.get("error_type", "")
-        if "bad_password" in error or "Invalid" in msg:
-            raise Exception("Неверный логин или пароль")
-        if "checkpoint" in error or "challenge" in str(data):
-            raise Exception("Требуется подтверждение входа. Используй /manual_cookies")
-        if "two_factor" in error or data.get("two_factor_required"):
+    logger.debug(f"[{username}] Login response {r.status_code}: {str(data)[:500]}")
+
+    msg   = data.get("message", "") if isinstance(data, dict) else str(data)
+    error = data.get("error_type", "") if isinstance(data, dict) else ""
+
+    if r.status_code == 400 or (isinstance(data, dict) and data.get("status") == "fail"):
+        if data.get("two_factor_required") or "two_factor" in error:
             raise TwoFactorRequired(username, data.get("two_factor_info", {}))
-        raise Exception(f"Ошибка: {msg or error or str(data)[:200]}")
+
+        if any(k in error for k in ("checkpoint", "challenge")) or \
+           any(k in str(data) for k in ("challenge_required", "checkpoint_required")):
+            raise Exception(
+                "Instagram требует подтверждение входа (checkpoint). "
+                "Используй /manual_cookies"
+            )
+
+        if any(k in error for k in ("rate_limit", "sentry_block", "spam")) or \
+           any(k in msg for k in ("wait a few minutes", "try again later", "Please wait")):
+            raise Exception(
+                "Instagram заблокировал вход временно (rate limit). "
+                "Подожди 15-30 минут и попробуй снова, "
+                "или используй /manual_cookies"
+            )
+
+        if any(k in error for k in ("bad_password", "invalid_user")) or \
+           any(k in msg for k in ("Invalid", "Incorrect password", "password was incorrect")):
+            raise Exception(
+                "Неверный логин или пароль. "
+                "Если пароль точно верный — Instagram мог заблокировать вход после "
+                "предыдущих попыток. Подожди 15-30 минут или используй /manual_cookies"
+            )
+
+        if "inactive user" in msg or "deactivated" in msg:
+            raise Exception("Аккаунт деактивирован или не существует.")
+
+        raise Exception(f"Instagram: {msg or error or str(data)[:200]}. Попробуй /manual_cookies")
+
+    if r.status_code == 429:
+        raise Exception("Слишком много запросов. Подожди 15-30 минут и попробуй снова.")
 
     if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
+        raise Exception(f"HTTP {r.status_code}. Попробуй /manual_cookies")
 
     if "logged_in_user" not in data:
-        raise Exception(f"Неожиданный ответ: {str(data)[:200]}")
+        if "challenge" in str(data) or "checkpoint" in str(data):
+            raise Exception("Instagram требует подтверждение входа. Используй /manual_cookies.")
+        raise Exception(f"Неожиданный ответ от Instagram: {str(data)[:300]}")
+
 
     user = data["logged_in_user"]
     return {
