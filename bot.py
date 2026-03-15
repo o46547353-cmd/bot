@@ -509,29 +509,49 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     if len(ctx.args) < 2:
         await upd.message.reply_text("Используй: /add_account login password")
-        return ConversationHandler.END   # BUG-17 FIX
+        return ConversationHandler.END
 
     login, password = ctx.args[0], ctx.args[1]
     ctx.user_data['pending_login']    = login
     ctx.user_data['pending_password'] = password
-    msg = await upd.message.reply_text(f"⏳ Авторизую *{login}*...", parse_mode='Markdown')
+    msg = await upd.message.reply_text(
+        f"⏳ Авторизую *{login}*...\n\n"
+        f"_Сначала пробую Bloks API, если не ответит — Danie1_",
+        parse_mode='Markdown'
+    )
     try:
         result = await asyncio.to_thread(threads_api.add_account, login, password)
-        # Фоново получаем Danie1 Bearer token (для image-постинга)
+        # Фоново получаем Danie1 token если ещё нет (для image-постинга)
         asyncio.ensure_future(_try_danie1_login_bg(login, password))
         await msg.edit_text(
-            f"✅ Аккаунт *{login}* добавлен (@{result.get('username', login)})\n"
-            f"⏳ Получаю Danie1 token для image-постинга...",
+            f"✅ Аккаунт *@{result.get('username', login)}* добавлен!\n"
+            f"⏳ Получаю Bearer-токен для image-постинга...",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")]])
         )
         return ConversationHandler.END
-    except TwoFactorRequired:
+    except TwoFactorRequired as e:
         ctx.user_data['2fa_login'] = login
-        await msg.edit_text(f"🔐 Нужен код 2FA для *{login}*\n\nВведи 6-значный код:", parse_mode='Markdown')
-        return WAIT_2FA   # BUG-17 FIX: правильно входим в диалог
+        # Определяем откуда пришёл 2FA запрос
+        pending = threads_api._pending_2fa.get(login, {})
+        method  = pending.get('method', 'bloks')
+        source  = "Danie1" if method == 'danie1' else "Instagram Bloks"
+        await msg.edit_text(
+            f"🔐 *Двухфакторная аутентификация*\n\n"
+            f"Аккаунт: *{login}*\n"
+            f"Источник запроса: _{source}_\n\n"
+            f"Введи 6-значный код из приложения-аутентификатора (Google Authenticator, Authy и т.п.):",
+            parse_mode='Markdown'
+        )
+        return WAIT_2FA
     except Exception as e:
-        await msg.edit_text(f"❌ {e}")
+        await msg.edit_text(
+            f"❌ *Не удалось добавить аккаунт*\n\n{e}",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🍪 Добавить через cookies", callback_data="acc:add_info")
+            ]])
+        )
         return ConversationHandler.END
 
 
@@ -547,14 +567,31 @@ async def _try_danie1_login_bg(login: str, password: str):
 async def handle_2fa(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     code  = upd.message.text.strip()
     login = ctx.user_data.get('2fa_login')
-    msg   = await upd.message.reply_text("⏳ Проверяю код...")
+    if not login:
+        await upd.message.reply_text("❌ Сессия не найдена. Начни заново с /add_account.")
+        return ConversationHandler.END
+
+    msg = await upd.message.reply_text(f"⏳ Проверяю код 2FA для *{login}*...", parse_mode='Markdown')
     try:
         result = await asyncio.to_thread(threads_api.confirm_2fa, login, code)
-        await msg.edit_text(f"✅ *{login}* добавлен (2FA ок)", parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")]]))
+        # Фоново пробуем Danie1 если зашли через Bloks
+        password = ctx.user_data.get('pending_password', '')
+        if password:
+            asyncio.ensure_future(_try_danie1_login_bg(login, password))
+        await msg.edit_text(
+            f"✅ *@{result.get('username', login)}* добавлен — 2FA подтверждена!",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")]])
+        )
     except Exception as e:
-        await msg.edit_text(f"❌ {e}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Попробовать cookies", callback_data="acc:add_info")]]))
+        await msg.edit_text(
+            f"❌ *{e}*",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Ввести код снова", callback_data=f"acc:add_info")],
+                [InlineKeyboardButton("🍪 Добавить через cookies", callback_data="acc:add_info")],
+            ])
+        )
     return ConversationHandler.END
 
 

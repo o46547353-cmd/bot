@@ -260,33 +260,55 @@ def load_accounts_from_db():
 # ══════════════════════════════════════════════════════════════
 
 def add_account(login: str, password: str) -> dict:
+    """
+    Цепочка авторизации:
+      1. Bloks API (metathreads) — быстро, но нестабильно
+      2. Danie1 (threads-api)   — fallback при ЛЮБОЙ ошибке Bloks
+    2FA перехватывается на каждом уровне и поднимается наверх.
+    """
     logger.info(f"[{login}] Авторизация через Bloks API...")
     try:
         result = threads_auth.login(login, password)
         return _save_from_bloks_result(login, result)
     except TwoFactorRequired:
-        _pending_2fa[login] = {'login': login, 'password': password}
+        # Bloks поймал 2FA — сохраняем pending и поднимаем наверх
+        _pending_2fa[login] = {'login': login, 'password': password, 'method': 'bloks'}
         raise
-    except BloksLoginFailed as e:
-        logger.warning(f"[{login}] Bloks login failed, пробую Danie1: {e}")
+    except Exception as e:
+        # Timeout, checkpoint, BloksLoginFailed и всё остальное → пробуем Danie1
+        err_str = str(e).lower()
+        # Checkpoint/challenge — смысла нет пробовать Danie1
+        if any(k in err_str for k in ('checkpoint', 'challenge', 'подтверждение входа')):
+            raise
+        logger.warning(f"[{login}] Bloks недоступен ({type(e).__name__}), пробую Danie1...")
         return _add_account_via_danie1(login, password)
 
 
-def confirm_2fa(login, code):
+def confirm_2fa(login: str, code: str) -> dict:
     if login not in _pending_2fa:
         raise Exception("Сессия 2FA не найдена. Начни заново с /add_account.")
-    pending  = _pending_2fa.pop(login)
+    pending = _pending_2fa[login]
+    method  = pending.get('method', 'bloks')
+
+    if method == 'danie1':
+        return _confirm_2fa_danie1_sync(login, code)
+
+    # Bloks 2FA — стандартный путь (metathreads)
     password = pending.get('password', '')
     try:
         result = threads_auth.login(login, password)
+        _pending_2fa.pop(login, None)
         return _save_from_bloks_result(login, result)
+    except TwoFactorRequired:
+        # Ещё раз запросил 2FA — значит код неверный
+        raise Exception("Неверный код 2FA. Попробуй ещё раз.")
     except Exception as e:
-        _pending_2fa[login] = pending
-        raise Exception(f"2FA не подтверждена: {e}\n\nДля аккаунтов с 2FA используй /manual_cookies")
+        _pending_2fa.pop(login, None)
+        raise Exception(f"Bloks 2FA не подтвердилась: {e}\n\nИспользуй /manual_cookies")
 
 
 def _add_account_via_danie1(login: str, password: str) -> dict:
-    """Вход через Danie1/threads-api когда Bloks вернул login failed. Вызывается из sync add_account."""
+    """Синхронная обёртка для Danie1-логина. Пробрасывает TwoFactorRequired наверх."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -294,38 +316,66 @@ def _add_account_via_danie1(login: str, password: str) -> dict:
             return loop.run_until_complete(_add_account_danie1_async(login, password))
         finally:
             loop.close()
+    except TwoFactorRequired:
+        raise  # пробрасываем 2FA наверх без оборачивания
     except Exception as e:
+        err = str(e)
         raise Exception(
-            f"Danie1 тоже не смог войти: {e}\n\n"
-            "Если пароль верный:\n"
-            "• Подожди 15-30 минут (Instagram блокирует)\n"
-            "• Или используй /manual_cookies"
+            f"Не удалось войти через Danie1: {err}\n\n"
+            "Что делать:\n"
+            "• Подожди 15-30 минут (Instagram блокирует после нескольких попыток)\n"
+            "• Или используй /manual_cookies — это всегда работает"
         )
 
 
 async def _add_account_danie1_async(login: str, password: str) -> dict:
-    """Логин через Danie1 + создание metathreads-клиента из того же токена (hybrid mode)."""
+    """Логин через Danie1 + hybrid metathreads-клиент. Поддерживает 2FA."""
     from threads_api.src.threads_api import ThreadsAPI
     api = ThreadsAPI()
-    ok = await api.login(login, password)
+    try:
+        ok = await api.login(login, password)
+    except Exception as exc:
+        err = str(exc).lower()
+        # Danie1 бросает исключение при 2FA — ловим и переходим в pending
+        if any(k in err for k in ('two_factor', '2fa', 'two factor', 'verification')):
+            # Вытаскиваем identifier из исключения (разные версии библиотеки кладут по-разному)
+            tf_id = (getattr(exc, 'two_factor_identifier', None)
+                     or getattr(exc, 'two_factor_info', {}).get('two_factor_identifier', '')
+                     or '')
+            _pending_2fa[login] = {
+                'login':    login,
+                'password': password,
+                'method':   'danie1',
+                'api':      api,       # сохраняем живой объект — нужен для confirm
+                'tf_id':    str(tf_id),
+            }
+            logger.info(f"[{login}] Danie1 требует 2FA. tf_id={tf_id}")
+            raise TwoFactorRequired(login)
+        raise  # другая ошибка — пробрасываем
+
     if not ok or not getattr(api, 'token', None):
-        raise Exception("Danie1: неверный логин или пароль, либо Instagram временно блокирует.")
+        raise Exception("Неверный логин или пароль (Danie1).")
+
+    return await _finalize_danie1_login(login, api)
+
+
+async def _finalize_danie1_login(login: str, api) -> dict:
+    """Сохраняет токен и создаёт hybrid-клиент после успешного Danie1-логина."""
     token    = api.token
-    user_id  = str(getattr(api, 'user_id', None) or '')
+    user_id  = str(getattr(api, 'user_id',  None) or '')
     username = str(getattr(api, 'username', None) or login)
 
     storage.set_setting(f'threads_api_token:{login}', token)
 
-    # Создаём metathreads-клиент из того же Bearer-токена — аккаунт получает полный функционал
     mt_client = None
     try:
         mt_client = _make_metathreads_from_danie1_token(token, user_id or login, username)
         logger.info(f"[{login}] metathreads hybrid-клиент создан ✓")
     except Exception as e:
-        logger.warning(f"[{login}] metathreads из токена не создан (продолжаем только с Danie1): {e}")
+        logger.warning(f"[{login}] metathreads из токена не создан: {e}")
 
     _clients[login] = {
-        'client':   mt_client,   # не None если токен пробросился в metathreads
+        'client':   mt_client,
         'username': username,
         'user_id':  user_id or login,
         'login':    login,
@@ -341,6 +391,52 @@ async def _add_account_danie1_async(login: str, password: str) -> dict:
     mode = 'hybrid' if mt_client else 'Danie1-only'
     logger.info(f"[{login}] Добавлен через Danie1 ({mode}). username={username}")
     return {'login': login, 'username': username}
+
+
+def _confirm_2fa_danie1_sync(login: str, code: str) -> dict:
+    """Синхронная обёртка для Danie1 2FA-подтверждения."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_confirm_2fa_danie1_async(login, code))
+    finally:
+        loop.close()
+
+
+async def _confirm_2fa_danie1_async(login: str, code: str) -> dict:
+    """Завершаем Danie1-логин с кодом 2FA."""
+    pending = _pending_2fa.get(login, {})
+    api     = pending.get('api')
+    tf_id   = pending.get('tf_id', '')
+
+    if not api:
+        raise Exception("Сессия Danie1 2FA не найдена. Начни заново с /add_account.")
+
+    # Пробуем разные варианты метода 2FA — разные версии библиотеки
+    ok = False
+    for method_name in ('two_factor_login', 'handle_two_factor_login', 'verify_two_factor'):
+        fn = getattr(api, method_name, None)
+        if fn is None:
+            continue
+        try:
+            ok = await fn(login, code.strip(), tf_id)
+            if ok:
+                break
+        except Exception as e:
+            logger.warning(f"[{login}] {method_name}() ошибка: {e}")
+            raise Exception(f"Неверный код 2FA или сессия истекла.\n\nОшибка: {e}")
+
+    if not ok or not getattr(api, 'token', None):
+        raise Exception(
+            "Код 2FA не принят.\n\n"
+            "Проверь:\n"
+            "• Правильность кода (он одноразовый!)\n"
+            "• Код не устарел (действует ~30 секунд)\n\n"
+            "Если не получается — используй /manual_cookies"
+        )
+
+    _pending_2fa.pop(login, None)
+    return await _finalize_danie1_login(login, api)
 
 
 def add_account_manual(login, session_id, csrf_token):
