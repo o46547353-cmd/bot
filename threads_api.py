@@ -253,6 +253,35 @@ def _post_image_to_threads(ig_cl, caption: str, image_path: str,
     return str((result.get('media') or {}).get('pk', ''))
 
 
+def _ig_post_text(ig_cl, caption: str, reply_to: str = None) -> str:
+    """Текстовый пост в Threads через instagrapi private API (fallback когда metathreads недоступен)."""
+    text_post_info: dict = {'reply_control': 0}
+    if reply_to:
+        text_post_info['reply_id'] = str(reply_to)
+
+    upload_id = str(int(time.time() * 1000))
+    data = {
+        'publish_mode':       'text_post',
+        'upload_id':          upload_id,
+        'text_post_app_info': json.dumps(text_post_info),
+        'timezone_offset':    '0',
+        'caption':            caption,
+        'audience':           'default',
+        '_uid':               str(ig_cl.user_id),
+        '_uuid':              ig_cl.uuid,
+        'device_id':          ig_cl.android_id,
+    }
+    signed = {'signed_body': f'SIGNATURE.{json.dumps(data)}'}
+    r = ig_cl.private.post(
+        'https://www.threads.net/api/v1/media/configure_text_post_app_feed/',
+        data=signed,
+    )
+    r.raise_for_status()
+    result = r.json()
+    return str((result.get('media') or {}).get('pk', ''))
+
+
+
 # ══════════════════════════════════════════════════════════════
 #  METATHREADS — ПУБЛИКАЦИЯ С REPLY_TO (текст)
 # ══════════════════════════════════════════════════════════════
@@ -472,12 +501,20 @@ def _save_from_instagrapi_result(login: str, password: str, result: dict) -> dic
     csrftoken = result.get('csrftoken', '')
     bearer    = result.get('auth_token', '')
 
-    # metathreads-клиент из Bearer-токена
+    # metathreads: сначала Bearer, fallback на sessionid cookie
     mt_client = None
-    try:
-        mt_client = _make_metathreads_from_token(bearer, user_id, username)
-    except Exception as e:
-        logger.warning(f"[{login}] metathreads из токена: {e}")
+    if bearer:
+        try:
+            mt_client = _make_metathreads_from_token(bearer, user_id, username)
+            logger.info(f"[{login}] metathreads via Bearer ✓")
+        except Exception as e:
+            logger.warning(f"[{login}] metathreads Bearer: {e}")
+    if mt_client is None and sessionid:
+        try:
+            mt_client = _make_metathreads_from_sessionid(sessionid, csrftoken, user_id, username)
+            logger.info(f"[{login}] metathreads via sessionid ✓")
+        except Exception as e:
+            logger.warning(f"[{login}] metathreads sessionid: {e}")
 
     _clients[login] = {
         'client':    mt_client,
@@ -488,7 +525,7 @@ def _save_from_instagrapi_result(login: str, password: str, result: dict) -> dic
     }
     storage.save_account({
         'login':      login,
-        'session_id': bearer or sessionid,
+        'session_id': sessionid,
         'csrf_token': csrftoken,
         'user_id':    user_id,
         'username':   username,
@@ -541,37 +578,61 @@ async def post_series_async(posts: dict, image_path: str = None,
                             account_login: str = None) -> list:
     """
     Публикует 4 поста.
-    post1/2/4 — текст через metathreads (reply_to цепочка).
-    post3 — с картинкой через instagrapi → fallback: текст через metathreads.
+    Приоритет: metathreads (reply_to цепочка) → fallback: instagrapi private API.
+    Картинка: instagrapi → fallback текст.
     """
     entry     = get_client(account_login)
     login     = entry['login']
     mt_client = entry['client']
     ig_client = entry.get('ig_client') or _get_ig_client(login)
 
-    if not mt_client:
+    # Нужен хотя бы один из клиентов
+    if not mt_client and not ig_client:
         raise Exception(
             f"Аккаунт {login} не инициализирован.\n"
             "Используй /add_account или /manual_cookies."
         )
 
     logger.info(f"[{login}] Публикую серию: {posts.get('topic', '—')}")
+    img = image_path if (image_path and os.path.exists(image_path)) else None
+
+    async def _post_text(caption: str, reply_to: str = None) -> str:
+        """Публикует текстовый пост: metathreads → fallback instagrapi."""
+        if mt_client:
+            try:
+                r = await asyncio.to_thread(
+                    _post_with_reply_metathreads, mt_client, caption, reply_to
+                )
+                pk = _pk(r)
+                if pk:
+                    return pk
+            except Exception as e:
+                logger.warning(f"[{login}] metathreads text post: {e}")
+        # fallback: instagrapi
+        if ig_client:
+            try:
+                pk = await asyncio.to_thread(
+                    _ig_post_text, ig_client, caption, reply_to
+                )
+                if pk:
+                    return pk
+            except Exception as e:
+                logger.warning(f"[{login}] instagrapi text post: {e}")
+        raise Exception(f"Не удалось опубликовать пост (оба метода упали)")
+
     ids = []
 
-    # — Пост 1 ─────────────────────────────────────────────────────────────────
-    r1  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post1'])
-    id1 = _pk(r1); ids.append(id1)
+    id1 = await _post_text(posts['post1'])
+    ids.append(id1)
     logger.info(f"[{login}] Пост 1: {id1}")
     await asyncio.sleep(random.uniform(8, 14))
 
-    # — Пост 2 ─────────────────────────────────────────────────────────────────
-    r2  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post2'], id1)
-    id2 = _pk(r2); ids.append(id2)
+    id2 = await _post_text(posts['post2'], id1)
+    ids.append(id2)
     logger.info(f"[{login}] Пост 2: {id2}")
     await asyncio.sleep(random.uniform(8, 14))
 
-    # — Пост 3 (с картинкой) ───────────────────────────────────────────────────
-    img = image_path if (image_path and os.path.exists(image_path)) else None
+    # Пост 3 — с картинкой если есть
     id3 = ''
     if img and ig_client:
         try:
@@ -580,20 +641,15 @@ async def post_series_async(posts: dict, image_path: str = None,
             )
             logger.info(f"[{login}] Пост 3 (image): {id3}")
         except Exception as e:
-            logger.warning(f"[{login}] Image posting упал ({e}), публикую текст...")
-            id3 = ''
-
+            logger.warning(f"[{login}] Image posting: {e}, публикую текст...")
     if not id3:
-        r3  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post3'], id2)
-        id3 = _pk(r3)
+        id3 = await _post_text(posts['post3'], id2)
         logger.info(f"[{login}] Пост 3 (текст): {id3}")
-
     ids.append(id3)
     await asyncio.sleep(random.uniform(8, 14))
 
-    # — Пост 4 ─────────────────────────────────────────────────────────────────
-    r4  = await asyncio.to_thread(_post_with_reply_metathreads, mt_client, posts['post4'], id3)
-    id4 = _pk(r4); ids.append(id4)
+    id4 = await _post_text(posts['post4'], id3)
+    ids.append(id4)
     logger.info(f"[{login}] Пост 4: {id4}")
 
     logger.info(f"[{login}] ✓ Серия опубликована: {ids}")
