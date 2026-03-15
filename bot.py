@@ -1,7 +1,5 @@
-### bot.py  —  FULLY FIXED
-# BUG-16 FIX: _reschedule_post() проверяет что scheduler запущен
-# BUG-17 FIX: cmd_add_account корректно возвращает ConversationHandler.END / WAIT_2FA
-# + интеграция Danie1/threads-api login при добавлении аккаунта
+### bot.py  —  v2: SlashThreadsClient (metathreads removed)
+# Auth: instagrapi | Operations: slash_threads_client.py
 
 import os, asyncio, logging, random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -89,8 +87,8 @@ HELP_TEXT = (
     "━━━━━━━━━ 💡 *Подсказки* ━━━━━━━━━\n"
     "• Прогрев и автопостинг включаются в меню *Автопилот*\n"
     "• Картинка прикрепляется к посту 3 (с тарифами и CTA)\n"
-    "• 🔑✅ Danie1 token есть — image-постинг работает\n"
-    "• 🔑❌ Нет token — добавь: `/add\\_account логин ПАРОЛЬ`"
+    "• 🔑✅ API подключён — постинг, прогрев, картинки работают\n"
+    "• 🔑❌ Нет сессии — добавь: `/add\\_account логин ПАРОЛЬ`"
 )
 
 
@@ -179,24 +177,17 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wp    = "🟢 Вкл" if acc.get('warmup_active')  else "⚫ Выкл"
         ap    = "🟢 Вкл" if acc.get('autopost_active') else "⚫ Выкл"
         img   = "🖼✅" if storage.get_image(login) else "🖼❌"
-        has_token = bool(storage.get_setting(f'threads_api_token:{login}'))
-        # Hybrid = токен есть И metathreads-клиент активен в памяти
         try:
-            mt_active = threads_api.get_client(login)['client'] is not None
+            cl_active = threads_api.get_client(login)['client'] is not None
         except Exception:
-            mt_active = False
-        if has_token and mt_active:
-            tok_status = "🔑✅ hybrid"
-        elif has_token:
-            tok_status = "🔑⚠️ token only"
-        else:
-            tok_status = "🔑❌"
+            cl_active = False
+        cl_status = "🔑✅" if cl_active else "🔑❌"
         has_ap = bool((acc.get('account_prompt') or '').strip())
         has_tp = bool((acc.get('topic_prompt') or '').strip())
         text = (
             f"*@{acc.get('username', login)}*\n\n"
             f"Прогрев: {wp}  |  Автопостинг: {ap}\n"
-            f"{img} Картинка  {tok_status} токен\n"
+            f"{img} Картинка  {cl_status} API\n"
             f"📝 Системный промпт: {'✅' if has_ap else '⚫ дефолтный'}\n"
             f"💡 Промпт тем: {'✅' if has_tp else '⚫ дефолтный'}\n\n"
             f"В очереди: {storage.count(login)}  |  Пресет: {acc.get('warmup_preset', 'A')}\n"
@@ -204,8 +195,8 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         toggle_w = "⏹ Стоп прогрев"  if acc.get('warmup_active')  else "▶️ Старт прогрев"
         toggle_a = "⏹ Стоп постинг"  if acc.get('autopost_active') else "▶️ Старт постинг"
-        # Кнопка обновления токена: всегда видна для danie1, для остальных — только если токен есть
-        show_refresh = (acc.get('auth_type') == 'danie1') or has_token
+        # Кнопка обновления токена
+        show_refresh = cl_active or (acc.get('auth_type') == 'instagrapi')
         rows = [
             [InlineKeyboardButton(toggle_w, callback_data=f"acc:toggle_w:{login}"),
              InlineKeyboardButton(toggle_a, callback_data=f"acc:toggle_a:{login}")],
@@ -214,6 +205,7 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("▶️ Пост сейчас", callback_data=f"acc:postnow:{login}")],
             [InlineKeyboardButton("🖼 Загрузить картинку",     callback_data=f"acc:upload_img:{login}")],
         ]
+        rows.append([InlineKeyboardButton("🧪 Тест прогрева",   callback_data=f"acc:test_warmup:{login}")])
         if show_refresh:
             rows.append([InlineKeyboardButton("🔄 Обновить токен",  callback_data=f"acc:refresh_token:{login}")])
         rows += [
@@ -365,6 +357,141 @@ async def cb_acc(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("◀️ К аккаунту",                callback_data=f"acc:manage:{login}")],
             ]))
 
+    elif action == 'test_warmup':
+        login = parts[2]
+        await q.edit_message_text(
+            f"🧪 *Тест прогрева @{login}*\n\n⏳ Запускаю проверку...\n"
+            f"search → threads → like → replies → stats",
+            parse_mode='Markdown'
+        )
+        asyncio.ensure_future(_run_warmup_test(q, login))
+
+
+async def _run_warmup_test(q, login: str):
+    """Прогоняет все методы прогрева по одному и шлёт отчёт."""
+    import time as _time
+
+    results = {}
+    details = []
+    test_kw = 'vpn'
+
+    acc = storage.get_account(login)
+    if acc:
+        raw_kw = acc.get('warmup_keywords', '')
+        if raw_kw:
+            first_kw = [k.strip() for k in raw_kw.split(',') if k.strip()]
+            if first_kw:
+                test_kw = first_kw[0]
+
+    # 1. search_users
+    users = []
+    try:
+        users = await asyncio.to_thread(threads_api.search_users, test_kw, login)
+        if users:
+            results['🔍 search'] = f'✅ {len(users)} юзеров'
+            names = ', '.join(f"@{u.get('username','?')}" for u in users[:3])
+            details.append(f"Поиск «{test_kw}»: {names}")
+        else:
+            results['🔍 search'] = '⚠️ пусто'
+    except Exception as e:
+        results['🔍 search'] = f'❌ {str(e)[:60]}'
+
+    await asyncio.sleep(3)
+
+    # 2. get_user_threads
+    test_user_id = None
+    test_post_id = None
+    posts = []
+
+    if users:
+        target = users[0]
+        test_user_id = str(target.get('pk') or target.get('id', ''))
+        target_name  = target.get('username', '?')
+        try:
+            posts = await asyncio.to_thread(threads_api.get_user_threads, test_user_id, login)
+            if posts:
+                results['📋 threads'] = f'✅ {len(posts)} постов'
+                test_post_id = str(posts[0].get('pk') or posts[0].get('id', ''))
+                details.append(f"@{target_name}: {len(posts)} постов")
+            else:
+                results['📋 threads'] = '⚠️ пусто'
+        except Exception as e:
+            results['📋 threads'] = f'❌ {str(e)[:60]}'
+    else:
+        results['📋 threads'] = '⏭ пропуск'
+
+    await asyncio.sleep(3)
+
+    # 3. like
+    if test_post_id:
+        try:
+            ok = await asyncio.to_thread(threads_api.like_thread, test_post_id, login)
+            results['❤️ like'] = '✅' if ok else '⚠️ False'
+            if ok:
+                details.append(f"Лайк: pk={test_post_id}")
+        except Exception as e:
+            results['❤️ like'] = f'❌ {str(e)[:60]}'
+    else:
+        results['❤️ like'] = '⏭ нет поста'
+
+    await asyncio.sleep(3)
+
+    # 4. get_thread_replies
+    if test_post_id:
+        try:
+            replies = await asyncio.to_thread(threads_api.get_thread_replies, test_post_id, login)
+            results['💬 replies'] = f'✅ {len(replies)} ответов'
+        except Exception as e:
+            results['💬 replies'] = f'❌ {str(e)[:60]}'
+    else:
+        results['💬 replies'] = '⏭ нет поста'
+
+    await asyncio.sleep(2)
+
+    # 5. get_thread_stats
+    if test_post_id:
+        try:
+            stats = await asyncio.to_thread(threads_api.get_thread_stats, test_post_id, login)
+            if stats:
+                results['📊 stats'] = f"✅ ❤️{stats.get('likes',0)} 💬{stats.get('replies',0)} 🔁{stats.get('reposts',0)}"
+            else:
+                results['📊 stats'] = '⚠️ пусто'
+        except Exception as e:
+            results['📊 stats'] = f'❌ {str(e)[:60]}'
+    else:
+        results['📊 stats'] = '⏭ нет поста'
+
+    # Собираем отчёт
+    ok_count  = sum(1 for v in results.values() if '✅' in v)
+    total     = len(results)
+    all_good  = ok_count == total
+
+    lines = [f"🧪 *Тест прогрева @{login}*\n"]
+    for method, status in results.items():
+        lines.append(f"{method}: {status}")
+
+    lines.append('')
+    if all_good:
+        lines.append("🎉 *Всё работает!* Прогрев можно включать.")
+    elif ok_count > 0:
+        lines.append(f"⚡ *{ok_count}/{total}* методов работают.")
+    else:
+        lines.append("💀 Ничего не работает. Проверь авторизацию.")
+
+    if details:
+        lines.append(f"\n_Детали: {'; '.join(details)}_")
+
+    kb = []
+    if all_good and acc and not acc.get('warmup_active'):
+        kb.append([InlineKeyboardButton("▶️ Включить прогрев", callback_data=f"acc:toggle_w:{login}")])
+    kb.append([InlineKeyboardButton("◀️ К аккаунту", callback_data=f"acc:manage:{login}")])
+
+    try:
+        await q.edit_message_text('\n'.join(lines), parse_mode='Markdown',
+                                   reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        pass
+
 
 # ─── Автопилот ───────────────────────────────────────────────────────────────
 
@@ -462,7 +589,11 @@ async def _show_status(q):
         wp  = "🟢" if acc.get('warmup_active')  else "⚫"
         ap  = "🟢" if acc.get('autopost_active') else "⚫"
         img = "🖼✅" if storage.get_image(a) else "🖼❌"
-        tok = "🔑✅" if storage.get_setting(f'threads_api_token:{a}') else "🔑❌"
+        try:
+            cl_ok = threads_api.get_client(a)['client'] is not None
+        except Exception:
+            cl_ok = False
+        tok = "🔑✅" if cl_ok else "🔑❌"
         lines.append(f"{wp} прогрев {ap} постинг {img} {tok}\n*@{acc.get('username', a)}* | очередь: {storage.count(a)}")
     await q.edit_message_text("\n".join(lines), parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([[
@@ -515,16 +646,16 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['pending_login']    = login
     ctx.user_data['pending_password'] = password
     msg = await upd.message.reply_text(
-        f"⏳ *Шаг 1/2* — Bloks API...\n`{login}`",
+        f"⏳ Авторизация...\n`{login}`",
         parse_mode='Markdown'
     )
 
     # Таймер который обновляет сообщение пока идёт авторизация
     async def _status_updater():
         steps = [
-            (22, "⏳ *Шаг 1/2* — Bloks не отвечает, пробую Danie1...\n`{login}`"),
-            (45, "⏳ *Шаг 2/2* — Danie1 авторизует...\n`{login}` _(может занять до 40с)_"),
-            (80, "⏳ Почти готово, Instagram медленно отвечает...\n`{login}`"),
+            (22, "⏳ Instagram думает...\n`{login}`"),
+            (45, "⏳ Почти готово...\n`{login}` _(может занять до 40с)_"),
+            (80, "⏳ Instagram медленно отвечает...\n`{login}`"),
         ]
         for delay, text in steps:
             await asyncio.sleep(delay)
@@ -541,10 +672,8 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             timeout=120  # максимум 2 минуты на всю цепочку
         )
         updater_task.cancel()
-        asyncio.ensure_future(_try_danie1_login_bg(login, password))
         await msg.edit_text(
-            f"✅ *@{result.get('username', login)}* добавлен!\n"
-            f"⏳ Получаю Bearer-токен для image-постинга...",
+            f"✅ *@{result.get('username', login)}* добавлен!",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 К аккаунтам", callback_data="menu:accounts")]])
         )
@@ -568,13 +697,9 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except TwoFactorRequired:
         updater_task.cancel()
         ctx.user_data['2fa_login'] = login
-        pending = threads_api._pending_2fa.get(login, {})
-        method  = pending.get('method', 'bloks')
-        source  = "Danie1" if method == 'danie1' else "Instagram Bloks"
         await msg.edit_text(
             f"🔐 *Двухфакторная аутентификация*\n\n"
-            f"Аккаунт: `{login}`\n"
-            f"Источник: _{source}_\n\n"
+            f"Аккаунт: `{login}`\n\n"
             f"Введи 6-значный код из Google Authenticator / Authy:",
             parse_mode='Markdown'
         )
@@ -592,15 +717,6 @@ async def cmd_add_account(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
-async def _try_danie1_login_bg(login: str, password: str):
-    try:
-        ok = await threads_api.login_danie1(login, password)
-        if ok:
-            logger.info(f"[{login}] Danie1 Bearer token получен фоново ✓")
-    except Exception as e:
-        logger.warning(f"[{login}] Danie1 фоновый login: {e}")
-
-
 async def handle_2fa(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     code  = upd.message.text.strip()
     login = ctx.user_data.get('2fa_login')
@@ -611,10 +727,6 @@ async def handle_2fa(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await upd.message.reply_text(f"⏳ Проверяю код 2FA для *{login}*...", parse_mode='Markdown')
     try:
         result = await asyncio.to_thread(threads_api.confirm_2fa, login, code)
-        # Фоново пробуем Danie1 если зашли через Bloks
-        password = ctx.user_data.get('pending_password', '')
-        if password:
-            asyncio.ensure_future(_try_danie1_login_bg(login, password))
         await msg.edit_text(
             f"✅ *@{result.get('username', login)}* добавлен — 2FA подтверждена!",
             parse_mode='Markdown',
@@ -1036,15 +1148,15 @@ async def universal_message_handler(upd: Update, ctx: ContextTypes.DEFAULT_TYPE)
         try:
             ok = await threads_api.refresh_token(login, password)
             if ok:
-                # Проверяем hybrid-статус
+                # Проверяем что клиент создан
                 try:
-                    mt_active = threads_api.get_client(login)['client'] is not None
+                    cl_active = threads_api.get_client(login)['client'] is not None
                 except Exception:
-                    mt_active = False
-                mode = "hybrid ✅ (metathreads + Danie1)" if mt_active else "Danie1-only ⚠️"
+                    cl_active = False
+                mode = "✅ полный доступ" if cl_active else "⚠️ частично"
                 await upd.message.reply_text(
                     f"✅ Токен обновлён для *@{uname}*\n\nРежим: {mode}\n\n"
-                    f"Теперь лайки, прогрев и репосты работают в полную силу.",
+                    f"Лайки, прогрев и репосты работают.",
                     parse_mode='Markdown',
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("👤 К аккаунту", callback_data=f"acc:manage:{login}")
